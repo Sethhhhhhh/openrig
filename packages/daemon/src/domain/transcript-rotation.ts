@@ -117,7 +117,8 @@ const activeSteps = new Map<string, number>();
 
 interface CaptureRequest { sessionName: string; isCurrent: () => boolean; resolve: (content: string | null) => void }
 
-// Sessions a batch's listing lacked: a seat that exited on its own keeps rotating until teardown. They read per target,
+// Sessions a batch's listing lacked: a seat that exited on its own keeps rotating until it is cleaned, relaunched or
+// torn down (a stopped or removed seat stops at once, see wireTranscriptCaptureStops). They read per target,
 // one fork that fails alone, instead of failing their chunk's chain every round. One that captures again rejoins.
 let unlistedSessions = new Set<string>();
 let pendingCaptures = new Map<TmuxAdapter, Map<number, CaptureRequest[]>>();

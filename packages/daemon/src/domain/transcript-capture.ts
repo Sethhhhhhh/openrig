@@ -1,8 +1,10 @@
 import type Database from "better-sqlite3";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { TranscriptStore } from "./transcript-store.js";
+import type { EventBus } from "./event-bus.js";
 import {
   startTranscriptRotation,
+  stopTranscriptRotation,
   getTranscriptRotationOptionsFromEnv,
 } from "./transcript-rotation.js";
 
@@ -34,6 +36,19 @@ export async function startTmuxTranscriptCapture(
     getTranscriptRotationOptionsFromEnv,
   );
   return { started: true };
+}
+
+/** End a seat's capture with its session, not only with its rig's teardown: a stopped seat, a removed node or pod
+ *  and a cleaned dead seat each record their end with one of these events, emitted once tmux has no such session
+ *  (or, for an unclaim, once OpenRig no longer manages it). A relaunch under the same name starts capture again. */
+export function wireTranscriptCaptureStops(eventBus: Pick<EventBus, "subscribe">): () => void {
+  return eventBus.subscribe((event) => {
+    if (event.type === "session.stopped" || event.type === "session.detached") {
+      stopTranscriptRotation(event.sessionName);
+    } else if (event.type === "session.cleaned") {
+      for (const sessionName of event.actions.sessionsExited) stopTranscriptRotation(sessionName);
+    }
+  });
 }
 
 interface RunningTranscriptSession {
