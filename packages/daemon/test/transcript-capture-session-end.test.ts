@@ -22,15 +22,17 @@ describe("transcript capture stops when a single session ends", () => {
   let db: Database.Database;
   let setup: ReturnType<typeof createTestApp>;
   let tmpDir: string;
+  let store: TranscriptStore;
   let unwire: () => void;
   const captureAdapter = { capturePaneContent: vi.fn(async () => "recent work\n") } as unknown as TmuxAdapter;
 
   beforeEach(() => {
     db = createFullTestDb();
-    // The transcript routes read where the claim's capture writes (the default root), so they serve its saved text.
-    setup = createTestApp(db, { appDeps: { transcriptStore: new TranscriptStore() } });
-    unwire = wireTranscriptCaptureStops(db, setup.eventBus);
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "transcript-session-end-"));
+    // The transcript routes read where the claim's capture and the rotations write, so they serve its saved text.
+    store = new TranscriptStore({ transcriptsRoot: tmpDir });
+    setup = createTestApp(db, { transcriptStore: store, appDeps: { transcriptStore: store } });
+    unwire = wireTranscriptCaptureStops(db, setup.eventBus);
   });
 
   afterEach(() => {
@@ -60,7 +62,22 @@ describe("transcript capture stops when a single session ends", () => {
   }
 
   function rotate(sessionName: string) {
-    startTranscriptRotation(captureAdapter, sessionName, path.join(tmpDir, `${sessionName}.log`), { lines: 10, pollIntervalMs: 60_000 });
+    startTranscriptRotation(captureAdapter, sessionName, store.getTranscriptPath("capture-rig", sessionName), { lines: 10, pollIntervalMs: 60_000 });
+  }
+
+  // Past the staleness limit on disk: only a running capture would make the saved text read as fresh.
+  function ageTranscript(rigName: string, sessionName: string) {
+    const longAgo = new Date(Date.now() - 60_000);
+    fs.utimesSync(store.getTranscriptPath(rigName, sessionName), longAgo, longAgo);
+  }
+
+  function reads(sessionName: string) {
+    const session = encodeURIComponent(sessionName);
+    return Promise.all([
+      setup.app.request(`/api/transcripts/${session}/tail?lines=5`),
+      setup.app.request(`/api/transcripts/${session}/grep?pattern=recent`),
+      setup.app.request(`/api/transcripts/${session}/full`),
+    ]);
   }
 
   async function settle(sessionName: string) {
@@ -162,35 +179,54 @@ describe("transcript capture stops when a single session ends", () => {
       activeCommand: "codex", runtimeHint: "codex", confidence: "high",
     });
     const claim = () => setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: "external.helper" });
-    const reads = async () => Promise.all([
-      setup.app.request("/api/transcripts/unclaim-capture-session/tail?lines=5"),
-      setup.app.request("/api/transcripts/unclaim-capture-session/grep?pattern=recent"),
-    ]);
-    const transcriptPath = new TranscriptStore().getTranscriptPath("unclaim-capture-rig", discovered.tmuxSession);
-    try {
-      const claimed = await claim();
-      expect(claimed.ok).toBe(true);
-      if (!claimed.ok) return;
-      expect(getActiveRotationCount()).toBe(1);
-      await settle(discovered.tmuxSession);
-      expect(getLastCaptureAt(discovered.tmuxSession)).toBeDefined();
-      // Past the staleness limit on disk: only the running capture keeps the saved text readable.
-      const longAgo = new Date(Date.now() - 60_000);
-      fs.utimesSync(transcriptPath, longAgo, longAgo);
+    const claimed = await claim();
+    expect(claimed.ok).toBe(true);
+    if (!claimed.ok) return;
+    expect(getActiveRotationCount()).toBe(1);
+    await settle(discovered.tmuxSession);
+    expect(getLastCaptureAt(discovered.tmuxSession)).toBeDefined();
+    ageTranscript("unclaim-capture-rig", discovered.tmuxSession);
 
-      const unclaim = await setup.app.request(`/api/sessions/${claimed.sessionId}/unclaim`, { method: "POST" });
-      expect(unclaim.status).toBe(200);
+    const unclaim = await setup.app.request(`/api/sessions/${claimed.sessionId}/unclaim`, { method: "POST" });
+    expect(unclaim.status).toBe(200);
 
-      expect(getActiveRotationCount()).toBe(1);
-      expect(getLastCaptureAt(discovered.tmuxSession)).toBeDefined();
-      for (const res of await reads()) expect(res.status).toBe(200);
+    expect(getActiveRotationCount()).toBe(1);
+    expect(getLastCaptureAt(discovered.tmuxSession)).toBeDefined();
+    for (const res of await reads(discovered.tmuxSession)) expect(res.status).toBe(200);
 
-      expect((await claim()).ok).toBe(true);
-      expect(getActiveRotationCount()).toBe(1);
-      for (const res of await reads()) expect(res.status).toBe(200);
-    } finally {
-      fs.rmSync(path.dirname(transcriptPath), { recursive: true, force: true });
+    expect((await claim()).ok).toBe(true);
+    expect(getActiveRotationCount()).toBe(1);
+    for (const res of await reads(discovered.tmuxSession)) expect(res.status).toBe(200);
+  });
+
+  it("a stopped or cleaned session serves its saved text, its ingest health saying capture is not live", async () => {
+    const stopped = seedSeat("dev.impl");
+    const cleaned = seedSeat("dev.qa");
+    rotate(stopped.sessionName);
+    rotate(cleaned.sessionName);
+    await settle(stopped.sessionName);
+    await settle(cleaned.sessionName);
+
+    tmux().hasSession.mockResolvedValue(true);
+    expect((await postSeat("stop", stopped.sessionName)).status).toBe(200);
+    tmux().hasSession.mockResolvedValue(false);
+    expect((await postSeat("clean", cleaned.sessionName)).status).toBe(200);
+    ageTranscript("capture-rig", stopped.sessionName);
+    ageTranscript("capture-rig", cleaned.sessionName);
+
+    for (const sessionName of [stopped.sessionName, cleaned.sessionName]) {
+      const [tail, grep, full] = await reads(sessionName);
+      for (const res of [tail, grep, full]) expect(res!.status).toBe(200);
+      const bodies = await Promise.all([tail!.json(), grep!.json(), full!.json()]) as Array<{
+        content?: string; matches?: string[]; ingestHealth: { state: string; reason: string };
+      }>;
+      expect(bodies[0]!.content).toContain("recent work");
+      expect(bodies[1]!.matches).toEqual(["recent work"]);
+      expect(bodies[2]!.content).toContain("recent work");
+      for (const body of bodies) expect(body.ingestHealth).toMatchObject({ state: "degraded", reason: "capture_stale" });
     }
+    // A read never starts the ended session's capture again.
+    expect(getActiveRotationCount()).toBe(0);
   });
 
   it("a relaunch under the same session name captures again after the stop", async () => {

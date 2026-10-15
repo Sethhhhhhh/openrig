@@ -276,6 +276,9 @@ export function createTestApp(
     /** Wire the ready runtime adapters into the routes' `runtimeAdapters`, as startup does, so a
      *  route launch can start harnesses. Off by default: existing tests keep no route adapters. */
     wireRuntimeAdapters?: boolean;
+    /** The transcript store the claim, self-attach and whoami services write to. Pass the same one in `appDeps`
+     *  for the transcript routes to read what they write. */
+    transcriptStore?: TranscriptStore;
     /** Extra or overriding createApp deps (browser-boundary route tests inject inert spies). */
     appDeps?: Partial<import("../../src/server.js").AppDeps>;
     /** Build through createAppWithWebSocket (production upgrade path) and return injectWebSocket. */
@@ -293,7 +296,7 @@ export function createTestApp(
   const queueRepo = new QueueRepository(db, eventBus);
   const tmux = opts?.tmux ?? mockTmuxAdapter();
   const cmux = opts?.cmux ?? unavailableCmuxAdapter();
-  const transcriptStore = new TranscriptStore("/tmp/openrig-test-transcripts");
+  const transcriptStore = opts?.transcriptStore ?? new TranscriptStore("/tmp/openrig-test-transcripts");
   const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
   const snapshotRepo = new SnapshotRepository(db);
   const checkpointStore = new CheckpointStore(db);
