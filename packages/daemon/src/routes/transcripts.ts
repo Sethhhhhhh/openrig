@@ -114,6 +114,8 @@ async function ensureTranscriptIngest(
   sessionName: string,
 ): Promise<{ health: RouteIngestHealth; started: boolean }> {
   let health = transcriptStore.getIngestHealth(resolution.rigName, sessionName);
+  // An ended session's capture stopped with it, however recent its saved file.
+  if (resolution.ended && health.state === "live") health = { ...health, state: "degraded", reason: "capture_stale" };
   let started = false;
   if (health.state !== "live" && !resolution.ended) {
     started = await tryStartCaptureForSession(

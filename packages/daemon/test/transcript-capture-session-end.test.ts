@@ -211,10 +211,8 @@ describe("transcript capture stops when a single session ends", () => {
     expect((await postSeat("stop", stopped.sessionName)).status).toBe(200);
     tmux().hasSession.mockResolvedValue(false);
     expect((await postSeat("clean", cleaned.sessionName)).status).toBe(200);
-    ageTranscript("capture-rig", stopped.sessionName);
-    ageTranscript("capture-rig", cleaned.sessionName);
 
-    for (const sessionName of [stopped.sessionName, cleaned.sessionName]) {
+    const expectSavedReads = async (sessionName: string) => {
       const [tail, grep, full] = await reads(sessionName);
       for (const res of [tail, grep, full]) expect(res!.status).toBe(200);
       const bodies = await Promise.all([tail!.json(), grep!.json(), full!.json()]) as Array<{
@@ -224,7 +222,12 @@ describe("transcript capture stops when a single session ends", () => {
       expect(bodies[1]!.matches).toEqual(["recent work"]);
       expect(bodies[2]!.content).toContain("recent work");
       for (const body of bodies) expect(body.ingestHealth).toMatchObject({ state: "degraded", reason: "capture_stale" });
-    }
+    };
+    // At once, while the saved files are still recent, then once they are past the staleness limit.
+    for (const sessionName of [stopped.sessionName, cleaned.sessionName]) await expectSavedReads(sessionName);
+    ageTranscript("capture-rig", stopped.sessionName);
+    ageTranscript("capture-rig", cleaned.sessionName);
+    for (const sessionName of [stopped.sessionName, cleaned.sessionName]) await expectSavedReads(sessionName);
     // A read never starts the ended session's capture again.
     expect(getActiveRotationCount()).toBe(0);
   });
