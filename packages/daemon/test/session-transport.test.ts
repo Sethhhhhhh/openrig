@@ -490,6 +490,8 @@ function mockTmux(overrides?: Partial<{
   sendKeys: (target: string, keys: string[]) => Promise<TmuxResult>;
   capturePaneContent: (paneId: string, lines?: number) => Promise<string | null>;
   getPaneCommand: (paneId: string) => Promise<string | null>;
+  isPaneInMode: (paneId: string) => Promise<boolean | null>;
+  cancelPaneMode: (target: string) => Promise<TmuxResult>;
 }>): TmuxAdapter {
   const hasSession = overrides?.hasSession ?? (async () => true);
   return {
@@ -510,6 +512,8 @@ function mockTmux(overrides?: Partial<{
     stopPipePane: async () => ({ ok: true as const }),
     getPanePid: async () => null,
     getPaneCommand: overrides?.getPaneCommand ?? (async () => null),
+    isPaneInMode: overrides?.isPaneInMode ?? (async () => false),
+    cancelPaneMode: overrides?.cancelPaneMode ?? (async () => ({ ok: true as const })),
   } as unknown as TmuxAdapter;
 }
 
@@ -592,6 +596,80 @@ describe("SessionTransport", () => {
     const result = await transport.send("dev-impl@my-rig", "hello");
     expect(result.ok).toBe(true);
     expect(callOrder).toEqual(["sendText", "sendKeys:Enter"]);
+  });
+
+  describe("#331: pane in tmux copy mode", () => {
+    // A pane that stays in its mode until cancelPaneMode runs, recording every call in order.
+    function modalPane(opts: { leaves: boolean; callOrder: string[]; capture?: string }) {
+      let inMode = true;
+      return mockTmux({
+        sendText: async () => { opts.callOrder.push("sendText"); return { ok: true }; },
+        sendKeys: async (_t, keys) => { opts.callOrder.push(`sendKeys:${keys.join(",")}`); return { ok: true }; },
+        ...(opts.capture !== undefined ? { capturePaneContent: async () => opts.capture! } : {}),
+        isPaneInMode: async () => inMode,
+        cancelPaneMode: async () => { opts.callOrder.push("cancelPaneMode"); if (opts.leaves) inMode = false; return { ok: true }; },
+      });
+    }
+
+    it("leaves the mode, then sends the text and Enter", async () => {
+      seedCanonicalRig();
+      const callOrder: string[] = [];
+      const transport = createTransport(modalPane({ leaves: true, callOrder }));
+
+      const result = await transport.send("dev-impl@my-rig", "hello");
+      expect(result.ok).toBe(true);
+      expect(callOrder).toEqual(["cancelPaneMode", "sendText", "sendKeys:Enter"]);
+    });
+
+    it("leaves the mode before a submitOnly Enter", async () => {
+      seedCanonicalRig();
+      const callOrder: string[] = [];
+      const transport = createTransport(modalPane({ leaves: true, callOrder, capture: "❯ staged message" }));
+
+      const result = await transport.send("dev-impl@my-rig", "", { submitOnly: true, expectedStagedText: "staged message" });
+      expect(result.ok).toBe(true);
+      expect(callOrder).toEqual(["cancelPaneMode", "sendKeys:Enter"]);
+    });
+
+    it("types nothing when the pane cannot leave the mode", async () => {
+      seedCanonicalRig();
+      const callOrder: string[] = [];
+      const transport = createTransport(modalPane({ leaves: false, callOrder }));
+
+      const result = await transport.send("dev-impl@my-rig", "hello");
+      expect(result).toMatchObject({ ok: false, reason: "pane_in_mode", sent: false });
+      expect(result.error).toContain("could not leave it");
+      expect(result.error).toContain("No text was sent.");
+      expect(callOrder).toEqual(["cancelPaneMode"]);
+    });
+
+    it("sends no submitOnly Enter when the pane cannot leave the mode", async () => {
+      seedCanonicalRig();
+      const callOrder: string[] = [];
+      const transport = createTransport(modalPane({ leaves: false, callOrder, capture: "❯ staged message" }));
+
+      const result = await transport.send("dev-impl@my-rig", "", { submitOnly: true, expectedStagedText: "staged message" });
+      expect(result).toMatchObject({ ok: false, reason: "pane_in_mode" });
+      expect(result.error).toContain("Nothing was submitted.");
+      expect(callOrder).toEqual(["cancelPaneMode"]);
+    });
+
+    it("sends as before when the mode is unknown", async () => {
+      seedCanonicalRig();
+      const callOrder: string[] = [];
+      const cancelPaneMode = vi.fn(async () => ({ ok: true as const }));
+      const transport = createTransport(mockTmux({
+        sendText: async () => { callOrder.push("sendText"); return { ok: true }; },
+        sendKeys: async (_t, keys) => { callOrder.push(`sendKeys:${keys.join(",")}`); return { ok: true }; },
+        isPaneInMode: async () => null,
+        cancelPaneMode,
+      }));
+
+      const result = await transport.send("dev-impl@my-rig", "hello");
+      expect(result.ok).toBe(true);
+      expect(callOrder).toEqual(["sendText", "sendKeys:Enter"]);
+      expect(cancelPaneMode).not.toHaveBeenCalled();
+    });
   });
 
   // Test 2: send to canonical session name resolves correctly

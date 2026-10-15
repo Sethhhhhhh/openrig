@@ -91,7 +91,7 @@ describe("rig launch --seats", () => {
     await launchCommand(deps).parseAsync(["node", "rig", "rig-1", "dev.pi", "--retry-startup-from", fragment, "--rig-root", directory]);
     expect(deps._client.post).toHaveBeenCalledWith("/api/rigs/rig-1/nodes/dev.pi/launch", {
       retryStartupFrom: { member: { id: "pi", runtime: "pi", agent_ref: "local:agent", profile: "default", cwd: "/project" }, rigRoot: directory },
-    });
+    }, { timeoutMs: 120_000 });
     expect(logs.join("\n")).toContain("Launched node dev.pi");
     expect(process.exitCode).toBeUndefined();
   });
@@ -347,6 +347,7 @@ describe("rig launch --seats", () => {
     expect(deps._client.post).toHaveBeenCalledWith(
       "/api/rigs/rig-1/nodes/dev.driver/launch",
       {},
+      { timeoutMs: 120_000 },
     );
     expect(process.exitCode).toBeUndefined();
   });

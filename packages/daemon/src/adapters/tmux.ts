@@ -726,6 +726,7 @@ export class TmuxAdapter {
     return this.guardedInput(target, () => this.sendShellCommandUnchecked(target, command, beforeInput, options));
   }
 
+  /** Stage or send a launch while leaving a consumed script's cleanup to the receiving shell. */
   private async sendShellCommandUnchecked(target: string, command: string, beforeInput: (() => void) | undefined, options: TmuxShellCommandOptions): Promise<TmuxResult> {
     const commandBytes = Buffer.byteLength(command, "utf8");
     // POSIX shells retain subshell isolation; unknown/unreadable panes use sh.
@@ -758,7 +759,7 @@ export class TmuxAdapter {
     let created = false;
     try {
       if (path) {
-        await this.fileOps.writeFile(path, `/bin/rm -f -- ${shellQuote(path)}\n${options.execInScript ? "exec " : ""}${command}\n`, { mode: 0o600, flag: "wx" });
+        await this.fileOps.writeFile(path, `/bin/rm -f -- ${shellQuote(path)} 2>/dev/null || command rm -f -- ${shellQuote(path)} || true\n${options.execInScript ? "exec " : ""}${command}\n`, { mode: 0o600, flag: "wx" });
         created = true;
       }
       const text = beforeInput ? await this.guardedInput(target, (pane, check) => this.sendTextUnchecked(pane, invocation, () => { check(); beforeInput(); }))
@@ -1060,6 +1061,26 @@ export class TmuxAdapter {
     } catch {
       return null;
     }
+  }
+
+  /** Whether a pane is in a mode such as copy mode. tmux reports #{pane_in_mode} as the number of
+   *  modes the pane is in, so any count above 0 is in a mode. Returns null if unavailable. */
+  async isPaneInMode(paneId: string): Promise<boolean | null> {
+    const target = exactTarget(paneId, "pane");
+    try {
+      const output = await this.run(["tmux", "display-message", "-p", "-t", target, "#{pane_in_mode}"],
+        `tmux display-message -p -t ${shellQuote(target)} "#{pane_in_mode}"`);
+      const trimmed = output.trim();
+      if (!/^\d+$/.test(trimmed)) return null;
+      return Number(trimmed) > 0;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Leave the pane's current mode (copy mode) with `send-keys -X cancel`, through the same input guard as sendKeys. */
+  async cancelPaneMode(target: string): Promise<TmuxResult> {
+    return this.guardedInput(target, (pane, beforeWrite) => { beforeWrite(); return this.sendKeysUnchecked(pane, ["-X", "cancel"]); });
   }
 
   /** A launch metadata read. Callers must never put credential values in terminal input. */

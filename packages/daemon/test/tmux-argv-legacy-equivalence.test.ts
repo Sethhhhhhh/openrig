@@ -114,6 +114,7 @@ async function driveEveryMethod(): Promise<RunCall[]> {
   await a.capturePaneHistory("%1");
   await a.setRemainOnExit("%1", true);
   await a.isPaneDead("%1");
+  await a.isPaneInMode("%1");
   await a.signalPaneProcess("%1", "TERM");
   await a.getPanePid(SESSION);
   await a.getDefaultShell();

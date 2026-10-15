@@ -533,6 +533,8 @@ export type AgentActivityEvidenceSource =
   | "session_registry";
 
 export interface AgentActivity {
+  turnId?: string | null;
+
   state: AgentActivityState;
   reason: string;
   evidenceSource: AgentActivityEvidenceSource;

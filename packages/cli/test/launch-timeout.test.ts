@@ -58,11 +58,29 @@ describe("local launch request deadlines", () => {
     expect(JSON.parse(requestBody)).toEqual({ seats: ["dev.driver"] });
   });
 
+  it("waits for a single-node launch response beyond the default five seconds without retrying", async () => {
+    let requests = 0;
+    server = http.createServer(async (req, res) => {
+      for await (const _chunk of req) { /* drain */ }
+      requests++;
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.write('{"ok":true,');
+      const timer = setTimeout(() => res.end('"nodeId":"n1","logicalId":"dev.driver","status":"launched"}'), 6_000);
+      res.on("close", () => clearTimeout(timer));
+    });
+    await new Promise<void>((resolve) => server!.listen(0, "127.0.0.1", resolve));
+    const client = new DaemonClient(`http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+    await launchCommand(deps(client)).parseAsync(["node", "rig", "rig-1", "dev.driver", "--json"]);
+    expect(process.exitCode).toBeUndefined();
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('"status": "launched"'));
+    expect(requests).toBe(1);
+  });
+
   it.each([
     { args: ["--seats", "dev.driver"], deadline: 120_000 },
     { args: ["--seats", "dev.driver", "--plan"], deadline: 5_000 },
     { args: ["dev.driver", "--plan"], deadline: 5_000 },
-    { args: ["dev.driver"], deadline: 5_000 },
+    { args: ["dev.driver"], deadline: 120_000 },
   ])("bounds $args at $deadline ms with no automatic retry", async ({ args, deadline }) => {
     vi.useFakeTimers();
     let writes = 0;

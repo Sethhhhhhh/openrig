@@ -21,7 +21,7 @@ import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
 import { claudeResumeRotation, type SessionRegistry } from "./session-registry.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
-import { latestHookWaitsOnPerson, type AgentActivityStore } from "./agent-activity-store.js";
+import { latestHookPermissionPending, latestHookWaitsOnPerson, type AgentActivityStore } from "./agent-activity-store.js";
 import type { EventBus } from "./event-bus.js";
 import type { AgentActivity } from "./types.js";
 import type { GuardTarget, SeatDeliveryGuard } from "./seat-delivery-guard.js";
@@ -2103,6 +2103,24 @@ export class SessionTransport {
       if (observation.state === "unknown") runtimeAdvisory = `runtime: ${observation.detail}; delivery proceeds without verified native identity.`;
       return null;
     };
+    // #331: with mouse on, scrolling a seat pane puts it in tmux copy mode. A paste still reaches
+    // the input there, but copy mode swallows the Enter, so the send would report ok while the
+    // text sits unsubmitted. Leave the mode once (send-keys -X cancel) and deliver; fail before
+    // typing anything only if the pane still reads as in a mode. An unknown answer keeps today's path.
+    const readPaneInMode = async (): Promise<boolean | null> => {
+      try {
+        return typeof this.tmuxAdapter.isPaneInMode === "function" ? await this.tmuxAdapter.isPaneInMode(sessionName) : null;
+      } catch { return null; }
+    };
+    const leavePaneMode = async (outcome: string): Promise<SendResult | null> => {
+      if (await readPaneInMode() !== true) return null;
+      try {
+        if (typeof this.tmuxAdapter.cancelPaneMode === "function") await this.tmuxAdapter.cancelPaneMode(sessionName);
+      } catch { /* the re-read below decides */ }
+      if (await readPaneInMode() !== true) return null;
+      return { ok: false, sessionName, sent: false, reason: "pane_in_mode",
+        error: `'${sessionName}' is in a tmux mode (such as copy mode) and could not leave it, so Enter would not reach the agent. ${outcome}` };
+    };
     // S01/S02 P2 observation context, frozen at attempt entry before any await.
     const observed = this.captureObserver ? {
       attemptId: randomUUID(),
@@ -2252,6 +2270,8 @@ export class SessionTransport {
       }
       const targetFailure = await checkClaudeTarget();
       if (targetFailure) return targetFailure;
+      const copyModeFailure = await leavePaneMode("Nothing was submitted.");
+      if (copyModeFailure) return copyModeFailure;
       const submitResult = await this.runStage(
         "session_transport.submit",
         () => this.tmuxAdapter.sendKeys(sessionName, ["Enter"]),
@@ -2506,6 +2526,8 @@ export class SessionTransport {
     // Recheck the selected recipient after readiness/capture awaits, at the input boundary.
     const targetFailure = await checkClaudeTarget();
     if (targetFailure) return observe(targetFailure);
+    const copyModeFailure = await leavePaneMode("No text was sent.");
+    if (copyModeFailure) return observe({ ...copyModeFailure, ...(waitMode ? waitEvidence : {}) });
 
     // 3. Deliver ordinary messages as paste, audited prompt answers as key input.
     if (observed) observed.sentHash = hashSentText(text);
@@ -2848,6 +2870,10 @@ export class SessionTransport {
       sessionName: input.sessionName,
       now,
     });
+    const permissionPending = latestHookPermissionPending(hookActivity, input.runtime);
+    if (hookActivity && permissionPending && this.hookFreshForSend(hookActivity, now)) {
+      return { ...hookActivity, state: "needs_input" };
+    }
     // Pane-only readiness never lets a hook authorise a send, but a fresh hook showing work or a
     // waiting person still refuses one, as it does for every other send.
     if (
@@ -2867,7 +2893,9 @@ export class SessionTransport {
       !input.readinessFromPaneOnly &&
       hookActivity &&
       hookActivity.evidenceSource === "runtime_hook" &&
-      hookActivity.stale !== true
+      hookActivity.stale !== true &&
+      hookActivity.reason !== "permission_request_pending" &&
+      hookActivity.reason !== "permission_prompt_cleared"
     ) {
       // Fresh hook (within the 15s send window): authoritative for any state.
       if (this.hookFreshForSend(hookActivity, now)) {
@@ -2928,6 +2956,9 @@ export class SessionTransport {
       (hookActivity.state === "running" || hookActivity.state === "needs_input")
     ) {
       return hookActivity;
+    }
+    if (probe.state === "unknown" && permissionPending) {
+      return { ...probe, state: "needs_input", reason: "permission_request_unverified" };
     }
     // A latest hook saying the seat waits on a person (approval, picker or elicitation) stays positive
     // picker evidence past the send window, and past the store's freshness window: nothing newer was
