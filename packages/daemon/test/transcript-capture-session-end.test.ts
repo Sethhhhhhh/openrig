@@ -9,6 +9,7 @@ import type Database from "better-sqlite3";
 import { createFullTestDb, createTestApp } from "./helpers/test-app.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { wireTranscriptCaptureStops } from "../src/domain/transcript-capture.js";
+import { TranscriptStore } from "../src/domain/transcript-store.js";
 import {
   clearAllTranscriptRotationsForTest,
   getActiveRotationCount,
@@ -26,8 +27,9 @@ describe("transcript capture stops when a single session ends", () => {
 
   beforeEach(() => {
     db = createFullTestDb();
-    setup = createTestApp(db);
-    unwire = wireTranscriptCaptureStops(setup.eventBus);
+    // The transcript routes read where the claim's capture writes (the default root), so they serve its saved text.
+    setup = createTestApp(db, { appDeps: { transcriptStore: new TranscriptStore() } });
+    unwire = wireTranscriptCaptureStops(db, setup.eventBus);
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "transcript-session-end-"));
   });
 
@@ -149,6 +151,46 @@ describe("transcript capture stops when a single session ends", () => {
     expect((await res.json() as { sessionKeptFor?: string }).sessionKeptFor).toBe("dev.impl@capture-rig");
 
     expect(getActiveRotationCount()).toBe(1);
+  });
+
+  it("an unclaimed session keeps its capture and its saved reads, and a re-claim keeps capturing", async () => {
+    tmux().capturePaneContent = vi.fn(async () => "recent work\n");
+    const rig = setup.rigRepo.createRig("unclaim-capture-rig");
+    setup.rigRepo.addNode(rig.id, "external.helper", { runtime: "codex" });
+    const discovered = setup.discoveryRepo.upsertDiscoveredSession({
+      tmuxSession: "unclaim-capture-session", tmuxPane: "%1", cwd: "/tmp",
+      activeCommand: "codex", runtimeHint: "codex", confidence: "high",
+    });
+    const claim = () => setup.claimService.bind({ discoveredId: discovered.id, rigId: rig.id, logicalId: "external.helper" });
+    const reads = async () => Promise.all([
+      setup.app.request("/api/transcripts/unclaim-capture-session/tail?lines=5"),
+      setup.app.request("/api/transcripts/unclaim-capture-session/grep?pattern=recent"),
+    ]);
+    const transcriptPath = new TranscriptStore().getTranscriptPath("unclaim-capture-rig", discovered.tmuxSession);
+    try {
+      const claimed = await claim();
+      expect(claimed.ok).toBe(true);
+      if (!claimed.ok) return;
+      expect(getActiveRotationCount()).toBe(1);
+      await settle(discovered.tmuxSession);
+      expect(getLastCaptureAt(discovered.tmuxSession)).toBeDefined();
+      // Past the staleness limit on disk: only the running capture keeps the saved text readable.
+      const longAgo = new Date(Date.now() - 60_000);
+      fs.utimesSync(transcriptPath, longAgo, longAgo);
+
+      const unclaim = await setup.app.request(`/api/sessions/${claimed.sessionId}/unclaim`, { method: "POST" });
+      expect(unclaim.status).toBe(200);
+
+      expect(getActiveRotationCount()).toBe(1);
+      expect(getLastCaptureAt(discovered.tmuxSession)).toBeDefined();
+      for (const res of await reads()) expect(res.status).toBe(200);
+
+      expect((await claim()).ok).toBe(true);
+      expect(getActiveRotationCount()).toBe(1);
+      for (const res of await reads()) expect(res.status).toBe(200);
+    } finally {
+      fs.rmSync(path.dirname(transcriptPath), { recursive: true, force: true });
+    }
   });
 
   it("a relaunch under the same session name captures again after the stop", async () => {

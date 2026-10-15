@@ -712,7 +712,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // Transcript rotators are process-local. Reattach them after lifecycle
   // reconciliation so surviving tmux sessions keep ingesting across daemon
   // restarts while genuinely detached sessions stay excluded.
-  wireTranscriptCaptureStops(eventBus);
+  wireTranscriptCaptureStops(db, eventBus);
   try {
     await resumeRunningTranscriptCaptures(db, tmuxAdapter, transcriptStore);
   } catch (err) {

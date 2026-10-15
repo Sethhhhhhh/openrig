@@ -39,12 +39,17 @@ export async function startTmuxTranscriptCapture(
 }
 
 /** End a seat's capture with its session, not only with its rig's teardown: a stopped seat, a removed node or pod
- *  and a cleaned dead seat each record their end with one of these events, emitted once tmux has no such session
- *  (or, for an unclaim, once OpenRig no longer manages it). A relaunch under the same name starts capture again. */
-export function wireTranscriptCaptureStops(eventBus: Pick<EventBus, "subscribe">): () => void {
+ *  and a cleaned dead seat each record their end with one of these events, emitted once tmux has no such session.
+ *  An unclaim records `session.detached` too, but its session keeps running and its saved text stays readable: only
+ *  a node removal deletes the node before notifying, so a detach whose node is gone is the one that ended.
+ *  A relaunch under the same name starts capture again. */
+export function wireTranscriptCaptureStops(db: Database.Database, eventBus: Pick<EventBus, "subscribe">): () => void {
+  const nodeExists = db.prepare("SELECT 1 FROM nodes WHERE id = ?");
   return eventBus.subscribe((event) => {
-    if (event.type === "session.stopped" || event.type === "session.detached") {
+    if (event.type === "session.stopped") {
       stopTranscriptRotation(event.sessionName);
+    } else if (event.type === "session.detached") {
+      if (!nodeExists.get(event.nodeId)) stopTranscriptRotation(event.sessionName);
     } else if (event.type === "session.cleaned") {
       for (const sessionName of event.actions.sessionsExited) stopTranscriptRotation(sessionName);
     }
