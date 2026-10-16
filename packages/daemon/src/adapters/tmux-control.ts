@@ -74,7 +74,9 @@ interface Pending {
 
 /** The replies of one control client, read off its stdout: each command's `%begin` … `%end` (or `%error`) block, in
  *  the order the commands were written. A block ends only on the line that repeats its own `%begin` header, so a pane
- *  line reading `%end …` never ends it. */
+ *  line reading `%end …` never ends it. Only a block whose flags (the header's third field) say the client sent the
+ *  command answers one: a hook (`after-list-panes` in a user's tmux.conf) prints its own blocks, flagged 0, between
+ *  them. */
 export class ControlReplies {
   private partial = "";
   private header: string | null = null;
@@ -107,12 +109,14 @@ export class ControlReplies {
     }
     if (line === `%end ${this.header}` || line === `%error ${this.header}`) {
       const ok = line.startsWith("%end ");
+      const flags = Number(this.header.split(" ")[2]);
       this.header = null;
       if (!this.attached) {
         this.attached = true;
         this.onAttached?.();
         return;
       }
+      if ((flags & 1) === 0) return;
       this.pending.shift()?.resolve({ ok, lines: this.lines });
       return;
     }
@@ -140,7 +144,8 @@ export type SpawnControlClient = () => ChildProcessWithoutNullStreams;
 
 export interface TmuxControlOptions {
   spawnClient?: SpawnControlClient;
-  /** A reply slower than this ends the client: it is started again for the next command. */
+  /** A read with no reply within this is asked again of a spawned client; the control client goes on. Also the time
+   *  the client has to attach. */
   replyTimeoutMs?: number;
   now?: () => number;
 }
@@ -241,9 +246,13 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     return starting;
   };
 
-  const send = (target: ControlClient, args: string[]): Promise<{ ok: boolean; lines: string[] }> =>
+  /** One command's reply. A read with none in time fails alone, without ending the client its other commands share: it
+   *  keeps its place in line, so its late reply is still taken for it (and dropped) and every later reply stays its own
+   *  command's. A write waits for its reply, as a spawned client waits for tmux: timing it out would report a failure
+   *  for input that may have landed. */
+  const send = (target: ControlClient, args: string[], deadline: boolean): Promise<{ ok: boolean; lines: string[] }> =>
     new Promise((resolve, reject) => {
-      const timer = setTimeout(() => drop(target.child, `no reply within ${replyTimeoutMs} ms`), replyTimeoutMs);
+      const timer = deadline ? setTimeout(() => reject(new Error(`tmux control client: no reply within ${replyTimeoutMs} ms`)), replyTimeoutMs) : undefined;
       target.replies.expect({
         resolve: (reply) => { clearTimeout(timer); resolve(reply); },
         reject: (error) => { clearTimeout(timer); reject(error); },
@@ -266,9 +275,10 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     for (const command of commands) {
       let reply: { ok: boolean; lines: string[] };
       try {
-        reply = await send(target, command);
+        reply = await send(target, command, !writes);
       } catch (err) {
-        // A read is asked again of a spawned client; a write may have landed, so its failure is reported, never repeated.
+        // A read is asked again of a spawned client. A write fails only when its client ended before replying: it may
+        // have landed, so its failure is reported, never repeated.
         if (writes) throw err;
         return fallback(argv);
       }

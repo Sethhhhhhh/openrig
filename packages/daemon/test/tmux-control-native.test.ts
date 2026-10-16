@@ -70,6 +70,19 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     }
   });
 
+  it("answers each command with its own output while a user's after-hook prints blocks between them", async () => {
+    tmux("set-hook", "-g", "after-list-panes", "list-sessions -F hook-output");
+    await control(["tmux", "has-session", "-t", "=seat@rig"]);
+    const pane = tmux("display-message", "-p", "-t", "=seat@rig:", "#{pane_id}");
+    const replies = await Promise.all([
+      control(["tmux", "list-panes", "-t", "=seat@rig:", "-F", "#{pane_id}"]),
+      control(["tmux", "display-message", "-p", "-t", "=seat@rig:", "b1"]),
+      control(["tmux", "display-message", "-p", "-t", "=seat@rig:", "b2"]),
+    ]);
+    expect(replies).toEqual([pane, "b1\n", "b2\n"]);
+    expect(await control(["tmux", "display-message", "-p", "-t", "=seat@rig:", "c1"])).toBe("c1\n");
+  });
+
   it("leaves its own session out of every listing, and the adapter its client out of the clients", async () => {
     await control(["tmux", "has-session", "-t", "=seat@rig"]);
     expect(tmux("list-sessions", "-F", "#{session_name}")).toContain(CONTROL_SESSION);
