@@ -1,7 +1,7 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
-import { connectionErrorCode, formatDaemonHostForUrl } from "./client.js";
+import { connectionErrorCode, formatDaemonHostForUrl, rememberSelfHostId } from "./client.js";
 import { blockedConnectionGuidance, isBlockedConnectionCode } from "./daemon-reachability.js";
 import type { DaemonStartLock } from "./daemon-start-lock.js";
 import { DAEMON_STOP_WAIT_MS, DAEMON_SHUTDOWN_RECEIPT, type DaemonShutdownReceipt } from "@openrig/daemon/daemon-shutdown";
@@ -991,6 +991,7 @@ export async function getDaemonStatus(
     try {
       const res = await probeHealthzWithSettle(deps, `${openrigUrl}/healthz`);
       const ev = await readHealthEvidence(res);
+      if (ev.selfHostId) rememberSelfHostId(openrigUrl, ev.selfHostId);
       const url = new URL(openrigUrl);
       return { state: "running", port: Number(url.port) || DEFAULT_PORT, host: url.hostname || DEFAULT_HOST, healthy: ev.healthy, reason: ev.reason, eventLoop: ev.eventLoop };
     } catch (err) {
@@ -1106,11 +1107,12 @@ export function tailLogs(deps: LifecycleDeps, opts: { follow: boolean }): void {
  */
 async function readHealthEvidence(
   res: { ok: boolean; json?: () => Promise<unknown> },
-): Promise<{ healthy: boolean; reason?: DaemonStatus["reason"]; eventLoop?: DaemonEventLoopEvidence }> {
+): Promise<{ healthy: boolean; reason?: DaemonStatus["reason"]; eventLoop?: DaemonEventLoopEvidence; selfHostId?: string }> {
   if (!res.ok) return { healthy: false };
   if (!res.json) return { healthy: true };
   try {
-    const body = (await res.json()) as { eventLoop?: Partial<DaemonEventLoopEvidence> } | null;
+    const body = (await res.json()) as { eventLoop?: Partial<DaemonEventLoopEvidence>; selfHostId?: unknown } | null;
+    const selfHostId = typeof body?.selfHostId === "string" && body.selfHostId.length > 0 ? body.selfHostId : undefined;
     const el = body?.eventLoop;
     if (el && typeof el.healthy === "boolean" && typeof el.lagMeanMs === "number") {
       const eventLoop: DaemonEventLoopEvidence = {
@@ -1121,9 +1123,10 @@ async function readHealthEvidence(
         healthy: el.healthy,
       };
       return el.healthy
-        ? { healthy: true, eventLoop }
-        : { healthy: false, reason: "event-loop-starved", eventLoop };
+        ? { healthy: true, eventLoop, selfHostId }
+        : { healthy: false, reason: "event-loop-starved", eventLoop, selfHostId };
     }
+    return { healthy: true, selfHostId };
   } catch {
     // Body absent / not JSON — treat as plain healthy (res.ok already true).
   }
