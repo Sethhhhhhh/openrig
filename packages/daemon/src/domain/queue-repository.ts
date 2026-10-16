@@ -3430,9 +3430,10 @@ export class QueueRepository {
         `SELECT ${columns} FROM queue_items ${where} ORDER BY ${orderBy} LIMIT ?`
       )
       .all(...params) as QueueItemRow[];
+    const ledgers = this.deliveryOutcomesFor(rows);
     const items = rows.map((r) => {
       const item = this.rowToItem(r, !opts?.compact);
-      const ledger = this.deliveryOutcomeFor(item.qitemId);
+      const ledger = ledgers.get(item.qitemId);
       return {
         ...item,
         deliveryOutcome: ledger?.outcome ?? null,
@@ -3762,8 +3763,13 @@ export class QueueRepository {
 
   /** Null means legacy/no OWNER history; inactive means OWNER history exists
    *  but the row no longer projects a current human-notification episode. */
-  private currentDeliveryEpisode(item: QueueItem, knownOwner?: QueueTransition): { notificationKey: string; startedAt: string } | "inactive" | null {
-    let transition = knownOwner ?? this.transitionLog.latestOwnerNotificationForQitem(item.qitemId);
+  private currentDeliveryEpisode(
+    item: LedgerItem,
+    latestOwner: QueueTransition | null,
+    latestOutbound: () => QueueTransition | undefined,
+    loadRegistry: () => LoadResult,
+  ): { notificationKey: string; startedAt: string } | "inactive" | null {
+    let transition = latestOwner;
     if (!transition) return null;
     // A human-decision-resolved notice written BY the transition that closed the row (a human's direct reply closing
     // it) is never posted: the Slack outbound lists active rows only (listHumanAlerts), and that human just answered.
@@ -3772,14 +3778,12 @@ export class QueueRepository {
     // stayed active is a real delivery and keeps its outcome after an agent later closes the row.
     let resolvedBy: string | null = null;
     if (transition.ownerNotificationKind === "human-decision-resolved" && !["pending", "in-progress", "blocked"].includes(transition.state)) {
-      const outbound = this.transitionLog.listForQitem(item.qitemId)
-        .filter((t) => t.ownerNotificationLevel != null && t.ownerNotificationKind != null && t.ownerNotificationKind !== "human-decision-resolved")
-        .sort((a, b) => b.transitionId - a.transitionId)[0];
+      const outbound = latestOutbound();
       if (!outbound) return "inactive";
       resolvedBy = transition.actorSession;
       transition = outbound;
     }
-    const registry = this.loadHumanRegistryFn();
+    const registry = loadRegistry();
     if (!registry.ok) return "inactive";
     // After that fallback the recipient is the human who answered: the row may be an agent's that was parked on them
     // (its destination is the agent, and closing cleared blocked_on).
@@ -3825,7 +3829,7 @@ export class QueueRepository {
     return ledger !== null && ledger.outcome === "posted" && ledger.episode?.notificationKey === `${qitemId}:${owner.transitionId}`;
   }
 
-  private deliveryLedger(qitemId: string, knownOwner?: QueueTransition): { outcome: "posted" | "transport-failed" | "never-posted"; detail: string; episode: { notificationKey: string; startedAt: string } | null } | null {
+  private deliveryLedger(qitemId: string, knownOwner?: QueueTransition): DeliveryLedger | null {
     // Some repository-only fixtures intentionally model the pre-transition
     // schema. Delivery projection is additive there: absence means no verdict,
     // never a list failure.
@@ -3834,24 +3838,63 @@ export class QueueRepository {
       .get(qitemId) as QueueItemRow | undefined;
     if (!row) return null;
     // The delivery episode uses row fields, not the waiting/backstop view.
-    // Keep this read fresh without repeating the caller's recovery-tag scan.
-    const item = this.rowToItem(row, false);
-    const episodeState = this.currentDeliveryEpisode(item, knownOwner);
-    if (episodeState === "inactive") return null;
-    const episode = episodeState;
+    const item = ledgerItem(row);
+    const episode = this.currentDeliveryEpisode(item, knownOwner ?? this.transitionLog.latestOwnerNotificationForQitem(qitemId),
+      () => this.transitionLog.listForQitem(qitemId).filter(isOutboundOwnerNotice).sort((a, b) => b.transitionId - a.transitionId)[0],
+      this.loadHumanRegistryFn);
+    if (episode === "inactive") return null;
     const notes = this.db.prepare(
       `SELECT transition_note FROM queue_transitions
         WHERE qitem_id = ? AND (transition_note LIKE 'slack-owner-notification-posted %'
                              OR transition_note LIKE 'slack-owner-notification-transport-failed %')
         ORDER BY transition_id DESC`,
     ).all(qitemId) as Array<{ transition_note: string }>;
+    return this.ledgerOf(item, episode, notes.map((note) => note.transition_note));
+  }
+
+  private receiptNotesStatement?: Database.Statement;
+
+  /** deliveryOutcomeFor for every row of a listing, with its reads batched: one read of the rows' owner notifications,
+   *  one of their receipts, the human registry loaded once at most. */
+  private deliveryOutcomesFor(rows: QueueItemRow[]): Map<string, DeliveryLedger> {
+    const ledgers = new Map<string, DeliveryLedger>();
+    if (!this.hasQueueTransitionsTable || rows.length === 0) return ledgers;
+    const qitemIds = rows.map((row) => row.qitem_id);
+    const owners = this.transitionLog.ownerNotificationsForQitems(qitemIds);
+    this.receiptNotesStatement ??= this.db.prepare(
+      `SELECT qitem_id, transition_note FROM queue_transitions
+        WHERE qitem_id IN (SELECT value FROM json_each(?)) AND (transition_note LIKE 'slack-owner-notification-posted %'
+                             OR transition_note LIKE 'slack-owner-notification-transport-failed %')
+        ORDER BY transition_id DESC`,
+    );
+    const notes = new Map<string, string[]>();
+    for (const row of this.receiptNotesStatement.all(JSON.stringify(qitemIds)) as Array<{ qitem_id: string; transition_note: string }>) {
+      const own = notes.get(row.qitem_id);
+      if (own) own.push(row.transition_note);
+      else notes.set(row.qitem_id, [row.transition_note]);
+    }
+    let registry: LoadResult | undefined;
+    const loadRegistry = () => (registry ??= this.loadHumanRegistryFn());
+    for (const row of rows) {
+      const item = ledgerItem(row);
+      const history = owners.get(row.qitem_id) ?? [];
+      const episode = this.currentDeliveryEpisode(item, history[0] ?? null, () => history.find(isOutboundOwnerNotice), loadRegistry);
+      if (episode === "inactive") continue;
+      const ledger = this.ledgerOf(item, episode, notes.get(row.qitem_id) ?? []);
+      if (ledger) ledgers.set(row.qitem_id, ledger);
+    }
+    return ledgers;
+  }
+
+  /** The ledger of one row's current episode, from its receipt notes (newest first). */
+  private ledgerOf(item: LedgerItem, episode: { notificationKey: string; startedAt: string } | null, notes: string[]): DeliveryLedger | null {
     const currentNotes = episode
-      ? notes.filter((note) => note.transition_note.split(/\s+/).includes(`notification_key=${episode.notificationKey}`))
+      ? notes.filter((note) => note.split(/\s+/).includes(`notification_key=${episode.notificationKey}`))
       : notes;
-    const posted = currentNotes.find((note) => note.transition_note.startsWith("slack-owner-notification-posted "));
-    if (posted) return { outcome: "posted", detail: posted.transition_note, episode };
-    const failed = currentNotes.find((note) => note.transition_note.startsWith("slack-owner-notification-transport-failed "));
-    if (failed) return { outcome: "transport-failed", detail: failed.transition_note, episode };
+    const posted = currentNotes.find((note) => note.startsWith("slack-owner-notification-posted "));
+    if (posted) return { outcome: "posted", detail: posted, episode };
+    const failed = currentNotes.find((note) => note.startsWith("slack-owner-notification-transport-failed "));
+    if (failed) return { outcome: "transport-failed", detail: failed, episode };
     const startedAt = episode?.startedAt ?? item.tsCreated;
     const gatewayRouted = episode !== null || item.lastNudgeResult?.startsWith("gateway-owned") === true;
     if (gatewayRouted) {
@@ -4200,6 +4243,27 @@ export class QueueRepository {
       targetRepo: row.target_repo ?? null,
     };
   }
+}
+
+/** The row fields a delivery ledger reads, as rowToItem presents them. */
+type LedgerItem = Pick<QueueItem, "qitemId" | "state" | "blockedOn" | "destinationSession" | "tsCreated" | "lastNudgeResult">;
+
+type DeliveryLedger = { outcome: "posted" | "transport-failed" | "never-posted"; detail: string; episode: { notificationKey: string; startedAt: string } | null };
+
+function ledgerItem(row: QueueItemRow): LedgerItem {
+  return {
+    qitemId: row.qitem_id,
+    state: row.state as QueueState,
+    blockedOn: row.blocked_on,
+    destinationSession: row.destination_session,
+    tsCreated: row.ts_created,
+    lastNudgeResult: presentedNudgeResult(row.last_nudge_result, row.claimed_at),
+  };
+}
+
+/** A notice sent to the owner, as opposed to the resolution notice a human's own answer writes. */
+function isOutboundOwnerNotice(t: QueueTransition): boolean {
+  return t.ownerNotificationLevel != null && t.ownerNotificationKind != null && t.ownerNotificationKind !== "human-decision-resolved";
 }
 
 function isQueueState(value: unknown): value is QueueState {

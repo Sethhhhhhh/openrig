@@ -383,6 +383,26 @@ export class QueueTransitionLog {
     return row ? this.rowToTransition(row) : null;
   }
 
+  private ownerNotificationsStatement?: Database.Statement;
+
+  /** Every owner-notification transition of these qitems, newest first, by qitem: the first is
+   *  latestOwnerNotificationForQitem's. One read for a whole listing. */
+  ownerNotificationsForQitems(qitemIds: readonly string[]): Map<string, QueueTransition[]> {
+    const byQitem = new Map<string, QueueTransition[]>();
+    if (!this.hasOwnerNotificationColumns || qitemIds.length === 0) return byQitem;
+    this.ownerNotificationsStatement ??= this.db.prepare(
+      `SELECT * FROM ${this.historySource}
+        WHERE qitem_id IN (SELECT value FROM json_each(?)) AND owner_notification_level IS NOT NULL
+        ORDER BY transition_id DESC`,
+    );
+    for (const row of this.ownerNotificationsStatement.all(JSON.stringify(qitemIds)) as QueueTransitionRow[]) {
+      const transitions = byQitem.get(row.qitem_id);
+      if (transitions) transitions.push(this.rowToTransition(row));
+      else byQitem.set(row.qitem_id, [this.rowToTransition(row)]);
+    }
+    return byQitem;
+  }
+
   hasOwnerNotificationReceipt(qitemId: string, notificationKey: string): boolean {
     const rows = this.db
       .prepare(
