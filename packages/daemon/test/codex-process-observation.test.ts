@@ -5,12 +5,16 @@ import { afterEach, expect, it, vi } from "vitest";
 import { defaultListProcesses } from "../src/adapters/codex-runtime-adapter.js";
 
 let scratch: string | undefined;
+const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 afterEach(() => {
+  Object.defineProperty(process, "platform", platform);
   vi.unstubAllEnvs();
   if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
 });
 
 it("reads foreground identity through the real async executable and parser path", async () => {
+  // ps is the process table's source off Linux.
+  Object.defineProperty(process, "platform", { value: "darwin" });
   scratch = fs.mkdtempSync(path.join(os.tmpdir(), "codex-process-read-"));
   // A hermetic ps executable; no provider, tmux or daemon is launched.
   const output = [

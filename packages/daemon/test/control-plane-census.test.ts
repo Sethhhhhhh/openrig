@@ -557,11 +557,15 @@ describe("OPR.0.5.3.10 — one census per cycle", () => {
     // whole freshness window. The census's production seam must reject instead.
     const { defaultListProcessesStrict } = await import("../src/domain/resume-metadata-refresher.js");
     const savedPath = process.env.PATH;
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
     try {
+      // ps is the process table's source off Linux; process-table.test.ts covers an unreadable /proc.
+      Object.defineProperty(process, "platform", { value: "darwin" });
       process.env.PATH = "/nonexistent-bin";
       await expect(defaultListProcessesStrict()).rejects.toThrow();
     } finally {
       process.env.PATH = savedPath;
+      Object.defineProperty(process, "platform", platform);
     }
     const rows = await defaultListProcessesStrict();
     expect(rows.length).toBeGreaterThan(0);

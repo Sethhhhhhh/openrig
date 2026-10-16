@@ -38,6 +38,7 @@ processMocks.execFile.mockImplementation((file: string, args: string[], _options
   callback(null, { stdout: [columns.join(" ").toUpperCase(), ...rows.map(line)].join("\n") + "\n", stderr: "" });
 });
 
+const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const databases: Database.Database[] = [];
 afterEach(() => { for (const db of databases.splice(0)) db.close(); });
 
@@ -57,8 +58,11 @@ async function strictRestore(processRows: Row[], panePid = 100, paths: Record<nu
     getPanePid: vi.fn(async () => panePid),
     getPaneCommand: vi.fn(async () => "claude"),
   };
+  // ps is the process table's source off Linux, and the stub above answers for it.
+  Object.defineProperty(process, "platform", { value: "darwin" });
   const result = await rebindAndVerifyPaneIdentity({ db, sessionRegistry: registry, tmux, nodeId: node.id,
-    sessionName: name, runtime: "claude-code", expectedResumeToken: "review-token", requireExactResumeLineage: true });
+    sessionName: name, runtime: "claude-code", expectedResumeToken: "review-token", requireExactResumeLineage: true })
+    .finally(() => Object.defineProperty(process, "platform", platform));
   return { ok: result.ok, observedPid: new SeatIdentityStore(db).getForNode(node.id)?.evidence.observedPid };
 }
 

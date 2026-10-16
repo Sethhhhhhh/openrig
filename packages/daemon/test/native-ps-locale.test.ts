@@ -15,7 +15,9 @@ const ENGLISH_START = "Wed Sep 30 21:44:48 2026";
 const MARKER = "synthetic-unrelated-marker";
 
 let scratch: string | undefined;
+const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 afterEach(() => {
+  Object.defineProperty(process, "platform", platform);
   vi.unstubAllEnvs();
   if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
   scratch = undefined;
@@ -40,6 +42,8 @@ function installLocaleAwarePs(): string {
   ].join("\n"), { mode: 0o755 });
   vi.stubEnv("PATH", scratch);
   vi.stubEnv("OPENRIG_PS_MARKER", MARKER);
+  // ps is the process table's source off Linux.
+  Object.defineProperty(process, "platform", { value: "darwin" });
   return envLog;
 }
 
