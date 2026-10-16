@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 
+import module from "node:module";
 import path from "node:path";
 import { existsSync, realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REEXEC_GUARD_ENV = "OPENRIG_BIN_REEXEC";
+
+// Each `rig` is a new process: Node (22.1 and later) keeps the modules it compiled on disk so the
+// next call skips compiling them again. Node 22.0 has no such call.
+module.enableCompileCache?.();
 
 export function resolveBinEntry(invokedPath = process.argv[1], moduleUrl = import.meta.url): string {
   const wrapperPath = invokedPath ? realpathSync(invokedPath) : realpathSync(fileURLToPath(moduleUrl));
@@ -85,7 +90,23 @@ export async function run(argv = process.argv): Promise<void> {
     normalizedArgv[1] = realpathSync(normalizedArgv[1]);
   }
 
-  const entryUrl = pathToFileURL(resolveBinEntry(normalizedArgv[1], import.meta.url)).href;
+  const entryPath = resolveBinEntry(normalizedArgv[1], import.meta.url);
+  // A named command loads only its own module (lazy-program.ts); feature-detected like the front
+  // door below, so the wrapper still runs an older sibling entry that has no lazy program.
+  const lazyPath = path.join(path.dirname(entryPath), "lazy-program.js");
+  if (normalizedArgv.length > 2 && existsSync(lazyPath)) {
+    const lazy = await import(pathToFileURL(lazyPath).href) as {
+      createLazyProgram: (first: string | undefined) => Promise<import("commander").Command | null>;
+      runProgram: (program: import("commander").Command, argv: string[]) => Promise<number>;
+    };
+    const program = await lazy.createLazyProgram(normalizedArgv[2]);
+    if (program) {
+      await lazy.runProgram(program, normalizedArgv);
+      return;
+    }
+  }
+
+  const entryUrl = pathToFileURL(entryPath).href;
   const mod = await import(entryUrl) as {
     createProgram: () => import("commander").Command;
     runProgram: (program: import("commander").Command, argv: string[]) => Promise<number>;
