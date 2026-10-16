@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parentSessionEnvKeys } from "../domain/parent-session-env.js";
+import { CONTROL_SESSION } from "./tmux-control.js";
 
 export type ExecFn = (cmd: string) => Promise<string>;
 
@@ -1515,7 +1516,8 @@ export class TmuxAdapter {
     try {
       const output = await this.run(["tmux", "list-clients", "-F", CLIENT_FORMAT],
         `tmux list-clients -F "${CLIENT_FORMAT}"`);
-      return parseLines(output, parseClientLine);
+      // The daemon's own control client (tmux-control.ts) is no terminal a person sees: never one to switch.
+      return parseLines(output, parseClientLine).filter((client) => client.session !== CONTROL_SESSION);
     } catch (err) {
       if (isNoServerError(err) || isTmuxTransportAbsentError(err)) return [];
       throw err;

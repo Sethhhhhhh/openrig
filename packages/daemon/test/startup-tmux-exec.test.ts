@@ -34,17 +34,32 @@ describe("createDaemon tmux exec wiring", { timeout: 120000 }, () => {
   });
 
   for (const host of ["linux", "darwin"] as const) {
-    it(`runs tmux without a shell on ${host}`, async () => {
+    it(`runs tmux without a shell, through its control client, on ${host}`, async () => {
       Object.defineProperty(process, "platform", { ...platform, value: host });
       const daemon = await createDaemon({ dbPath: ":memory:", cmuxFactory });
       try {
-        expect(argvExecOf(daemon.deps.tmuxAdapter)).toBe(execArgvCommand);
+        const exec = argvExecOf(daemon.deps.tmuxAdapter) as (ArgvExecFn & { close?: () => void }) | undefined;
+        expect(exec).not.toBe(execArgvCommand);
+        expect(typeof exec?.close).toBe("function");
+        exec?.close?.();
       } finally {
         daemon.eventLoopMonitor.stop();
         daemon.db.close();
       }
     });
   }
+
+  it("OPENRIG_TMUX_CONTROL=0 spawns a tmux client per command, without a shell", async () => {
+    vi.stubEnv("OPENRIG_TMUX_CONTROL", "0");
+    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+    const daemon = await createDaemon({ dbPath: ":memory:", cmuxFactory });
+    try {
+      expect(argvExecOf(daemon.deps.tmuxAdapter)).toBe(execArgvCommand);
+    } finally {
+      daemon.eventLoopMonitor.stop();
+      daemon.db.close();
+    }
+  });
 
   it("OPENRIG_TMUX_SHELL=1 keeps tmux on the shell path on linux, and is ignored on Windows", async () => {
     vi.stubEnv("OPENRIG_TMUX_SHELL", "1");
