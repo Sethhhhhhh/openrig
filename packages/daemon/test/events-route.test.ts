@@ -231,6 +231,56 @@ describe("SSE events route", () => {
     expect(events[0]!.id).toBe(String(emitted.seq));
   });
 
+  describe("replay without Last-Event-ID", () => {
+    const emitMany = (rigId: string, count: number) =>
+      Array.from({ length: count }, (_, i) => eventBus.emit({ type: "node.added", rigId, nodeId: `n${i}`, logicalId: `w${i}` }).seq);
+    const ids = (events: { id: string }[]) => events.map((e) => Number(e.id));
+
+    it("replays the whole log by default, as before", async () => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 103);
+      const events = await readSSEEvents(await app.request(`/api/events?rigId=${rig.id}`), 103, 2000);
+      expect(ids(events)).toEqual(seqs);
+    });
+
+    it("replay=<n> replays the newest n, replay=0 starts from now, replay=all replays the whole log", async () => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 5);
+      expect(ids(await readSSEEvents(await app.request(`/api/events?rigId=${rig.id}&replay=2`), 5))).toEqual(seqs.slice(-2));
+      expect(ids(await readSSEEvents(await app.request(`/api/events?replay=all`), 5))).toEqual(seqs);
+
+      const live = await app.request(`/api/events?rigId=${rig.id}&replay=0`);
+      setTimeout(() => eventBus.emit({ type: "rig.created", rigId: rig.id }), 10);
+      const events = await readSSEEvents(live, 2);
+      expect(events.map((e) => JSON.parse(e.data).type)).toEqual(["rig.created"]);
+    });
+
+    it("Last-Event-ID, which EventSource sends when it reconnects, wins over replay", async () => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 3);
+      const res = await app.request(`/api/events?rigId=${rig.id}&replay=0`, { headers: { "Last-Event-ID": String(seqs[0]) } });
+      expect(ids(await readSSEEvents(res, 3))).toEqual(seqs.slice(1));
+    });
+
+    it("refuses a replay that is neither a number nor all", async () => {
+      for (const value of ["-1", "some", "1.5", ""]) {
+        const res = await app.request(`/api/events?replay=${value}`);
+        expect(res.status, value).toBe(400);
+      }
+    });
+
+    it("streams a long replay a page at a time, every event once and in order", async () => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 1201);
+      const replayAll = vi.spyOn(eventBus, "replayAll");
+      const page = vi.spyOn(eventBus, "replayPage");
+      const events = await readSSEEvents(await app.request(`/api/events?replay=all`), 1201, 5000);
+      expect(ids(events)).toEqual(seqs);
+      expect(replayAll).not.toHaveBeenCalled();
+      expect(page.mock.calls.length).toBeGreaterThanOrEqual(3);
+    });
+  });
+
   it("production app mounts /api/events (regression)", async () => {
     const cmuxFactory: CmuxTransportFactory = async () => {
       throw Object.assign(new Error(""), { code: "ENOENT" });

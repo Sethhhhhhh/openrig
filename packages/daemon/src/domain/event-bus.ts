@@ -209,6 +209,28 @@ export class EventBus {
     return rows.map((row) => this.rowToPersistedEvent(row));
   }
 
+  private pageStatements?: { all: Database.Statement; rig: Database.Statement };
+
+  /** Up to `limit` events after `seq`, oldest first, of one rig when `rigId` is given: a replay read a page at a time. */
+  replayPage(seq: number, limit: number, rigId?: string): PersistedEvent[] {
+    this.pageStatements ??= {
+      all: this.db.prepare("SELECT seq, rig_id, node_id, type, payload, created_at FROM events WHERE seq > ? ORDER BY seq LIMIT ?"),
+      rig: this.db.prepare("SELECT seq, rig_id, node_id, type, payload, created_at FROM events WHERE rig_id = ? AND seq > ? ORDER BY seq LIMIT ?"),
+    };
+    const rows = (rigId ? this.pageStatements.rig.all(rigId, seq, limit) : this.pageStatements.all.all(seq, limit)) as EventRow[];
+    return rows.map((row) => this.rowToPersistedEvent(row));
+  }
+
+  /** The seq after which the newest `count` events start (of one rig when `rigId` is given): 0 when there are no more
+   *  than `count`, the newest seq for 0. */
+  seqBeforeNewest(count: number, rigId?: string): number {
+    if (count === 0) return this.maxSeq();
+    const row = (rigId
+      ? this.db.prepare("SELECT seq FROM events WHERE rig_id = ? ORDER BY seq DESC LIMIT 1 OFFSET ?").get(rigId, count)
+      : this.db.prepare("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET ?").get(count)) as { seq: number } | undefined;
+    return row?.seq ?? 0;
+  }
+
   private drainNotifyRowsToQuiescence(startAfter: number): void {
     if (this.drainingNotifyRows || this.notifyingSubscribers) return;
     this.drainingNotifyRows = true;

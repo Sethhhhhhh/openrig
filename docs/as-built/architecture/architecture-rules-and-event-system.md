@@ -221,7 +221,14 @@ SSE delivery surfaces include the following. The daemon has **11**
 `git grep -l 'streamSSE(' -- packages/daemon/src/routes | wc -l`).
 
 - `GET /api/events` — global stream of all events (`server.ts:730`
-  `app.route("/api/events", eventsRoute)`).
+  `app.route("/api/events", eventsRoute)`); `?rigId=` keeps one rig's. Each
+  event's SSE `id` is its `seq`. Before going live, a connection replays
+  stored events, read and written 500 at a time (`routes/events.ts`):
+  - with a `Last-Event-ID` header (an `EventSource` sends it when it
+    reconnects), every event after that `seq`, whatever `replay` says;
+  - otherwise `?replay=<n>`: the newest `n` events (of the rig, with
+    `rigId`); `replay=0` starts from now; `replay=all`, or no `replay`,
+    replays the whole log. Any other value is a `400`.
 - `GET /api/stream/watch` — new stream items (`routes/stream.ts:194`).
 - `GET /api/queue/watch` — queue/inbox coordination events
   (`routes/queue.ts:1054`, with a `/sse` alias at `:1055`).
