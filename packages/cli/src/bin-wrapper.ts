@@ -5,6 +5,7 @@ import path from "node:path";
 import { existsSync, realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { formatCliError, wantsJsonOutput, type RunProgramIo } from "./cli-error.js";
 
 const REEXEC_GUARD_ENV = "OPENRIG_BIN_REEXEC";
 
@@ -84,7 +85,18 @@ export function canLoadInstalledNative(node: string, wrapper: string): boolean {
   return probe.status === 0;
 }
 
-export async function run(argv = process.argv): Promise<void> {
+/** A command whose modules cannot be loaded fails as any other command does: the shared error object on stdout under
+ *  `--json`, `error: …` on stderr otherwise, and exit 1. */
+function failedToLoad(argv: string[], error: unknown, io: RunProgramIo): void {
+  const failure = formatCliError(error);
+  const out = io.out ?? ((l: string) => process.stdout.write(l + "\n"));
+  const err = io.err ?? ((l: string) => process.stderr.write(l + "\n"));
+  if (wantsJsonOutput(argv.slice(2))) out(JSON.stringify(failure));
+  else err(`error: ${failure.error.message}`);
+  (io.exit ?? ((c: number) => process.exit(c)))(1);
+}
+
+export async function run(argv = process.argv, io: RunProgramIo = {}): Promise<void> {
   const normalizedArgv = [...argv];
   if (normalizedArgv[1]) {
     normalizedArgv[1] = realpathSync(normalizedArgv[1]);
@@ -95,23 +107,36 @@ export async function run(argv = process.argv): Promise<void> {
   // door below, so the wrapper still runs an older sibling entry that has no lazy program.
   const lazyPath = path.join(path.dirname(entryPath), "lazy-program.js");
   if (normalizedArgv.length > 2 && existsSync(lazyPath)) {
-    const lazy = await import(pathToFileURL(lazyPath).href) as {
+    let lazy: {
       createLazyProgram: (first: string | undefined) => Promise<import("commander").Command | null>;
-      runProgram: (program: import("commander").Command, argv: string[]) => Promise<number>;
+      runProgram: (program: import("commander").Command, argv: string[], io?: RunProgramIo) => Promise<number>;
     };
-    const program = await lazy.createLazyProgram(normalizedArgv[2]);
+    let program: import("commander").Command | null;
+    try {
+      lazy = await import(pathToFileURL(lazyPath).href) as typeof lazy;
+      program = await lazy.createLazyProgram(normalizedArgv[2]);
+    } catch (error) {
+      failedToLoad(normalizedArgv, error, io);
+      return;
+    }
     if (program) {
-      await lazy.runProgram(program, normalizedArgv);
+      await lazy.runProgram(program, normalizedArgv, io);
       return;
     }
   }
 
   const entryUrl = pathToFileURL(entryPath).href;
-  const mod = await import(entryUrl) as {
+  let mod: {
     createProgram: () => import("commander").Command;
-    runProgram: (program: import("commander").Command, argv: string[]) => Promise<number>;
+    runProgram: (program: import("commander").Command, argv: string[], io?: RunProgramIo) => Promise<number>;
     runFrontDoor?: (argv: readonly string[]) => Promise<boolean>;
   };
+  try {
+    mod = await import(entryUrl) as typeof mod;
+  } catch (error) {
+    failedToLoad(normalizedArgv, error, io);
+    return;
+  }
   // Slice 17: the PUBLIC bin is the real front door — bare `rig` in a TTY
   // opens the TUI here, not only under a direct `node dist/index.js` run
   // (guard finding 1: importing the entry makes its isDirectRun false).
@@ -120,7 +145,7 @@ export async function run(argv = process.argv): Promise<void> {
   if (owned) return;
   // Slice 15: run through the shared error path so `--json` failures emit a JSON
   // error object with a nonzero exit instead of plain Commander text.
-  await mod.runProgram(mod.createProgram(), normalizedArgv);
+  await mod.runProgram(mod.createProgram(), normalizedArgv, io);
 }
 
 if (isDirectRun()) {

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { resolveBinEntry, resolveNodeReexecBinary } from "../src/bin-wrapper.js";
+import { resolveBinEntry, resolveNodeReexecBinary, run } from "../src/bin-wrapper.js";
 
 describe("bin-wrapper", () => {
   let tempDir: string | null = null;
@@ -46,6 +46,36 @@ describe("bin-wrapper", () => {
     );
 
     expect(reexecNode).toBe(siblingNodePath);
+  });
+
+  it("a command whose module cannot be loaded fails with the CLI's error shape, as JSON under --json", async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "openrig-bin-wrapper-"));
+    const dist = path.join(tempDir, "dist");
+    fs.mkdirSync(dist);
+    const wrapper = path.join(dist, "bin-wrapper.js");
+    fs.writeFileSync(wrapper, "");
+    // An install missing one command's module: the lazy program loads, the command's import fails.
+    fs.writeFileSync(path.join(dist, "lazy-program.js"),
+      "export async function createLazyProgram() { return (await import('./commands/queue.js')).queueCommand(); }\nexport async function runProgram() { return 0; }\n");
+    const run1 = async (...args: string[]) => {
+      const out: string[] = [];
+      const err: string[] = [];
+      const codes: number[] = [];
+      await run(["node", wrapper, ...args], { out: (l) => out.push(l), err: (l) => err.push(l), exit: (c) => { codes.push(c); } });
+      return { out, err, codes };
+    };
+
+    const json = await run1("queue", "list", "--json");
+    expect(json.codes).toEqual([1]);
+    expect(json.err).toEqual([]);
+    expect(json.out).toHaveLength(1);
+    const parsed = JSON.parse(json.out[0]!);
+    expect(parsed).toEqual({ ok: false, error: { code: "ERR_MODULE_NOT_FOUND", message: expect.stringContaining("commands/queue.js") } });
+
+    const human = await run1("queue", "list");
+    expect(human.codes).toEqual([1]);
+    expect(human.out).toEqual([]);
+    expect(human.err).toEqual([`error: ${parsed.error.message}`]);
   });
 
   it("does not re-exec when already running under the sibling node", () => {
