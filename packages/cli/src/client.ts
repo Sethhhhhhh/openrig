@@ -151,6 +151,15 @@ function localDaemonUrl(): string | undefined {
   }
 }
 
+/** The selfHostId each daemon endpoint answered on /healthz in this process, by its base URL. */
+const knownSelfHostIds = new Map<string, string>();
+
+/** Keeps what an endpoint's /healthz answered, so a client of that endpoint proves its locality without a
+ *  second /healthz: in this process a third request makes fetch's exit some 60 ms slower. */
+export function rememberSelfHostId(baseUrl: string, selfHostId: string): void {
+  knownSelfHostIds.set(baseUrl.replace(/\/+$/, ""), selfHostId);
+}
+
 export class DaemonClient {
   readonly baseUrl: string;
   private fetchImpl: typeof fetch = fetch;
@@ -175,19 +184,24 @@ export class DaemonClient {
     }
     if (!this.remoteTarget) {
       // Loopback may be a forwarded endpoint. Only matching instance identity proves locality.
-      const controller = new AbortController();
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        const target = await Promise.race([
-          (async () => {
-            const res = await this.fetchImpl(`${this.baseUrl.replace(/\/+$/, "")}/healthz`, { signal: controller.signal });
-            return res.ok ? (await res.json() as { selfHostId?: unknown }).selfHostId : undefined;
-          })(),
-          new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), Math.min(this.timeoutMs, 1000)); }),
-        ]);
-        if (target === origin) return localHeaders;
-      } catch { /* Unproved locality: carry the known origin, never the endpoint's identity. */ }
-      finally { clearTimeout(timer); controller.abort(); }
+      // The status probe just before this request may already have read it from this endpoint.
+      const known = knownSelfHostIds.get(this.baseUrl.replace(/\/+$/, ""));
+      if (known === origin) return localHeaders;
+      if (known === undefined) {
+        const controller = new AbortController();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const target = await Promise.race([
+            (async () => {
+              const res = await this.fetchImpl(`${this.baseUrl.replace(/\/+$/, "")}/healthz`, { signal: controller.signal });
+              return res.ok ? (await res.json() as { selfHostId?: unknown }).selfHostId : undefined;
+            })(),
+            new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), Math.min(this.timeoutMs, 1000)); }),
+          ]);
+          if (target === origin) return localHeaders;
+        } catch { /* Unproved locality: carry the known origin, never the endpoint's identity. */ }
+        finally { clearTimeout(timer); controller.abort(); }
+      }
     }
     return senderIdentityHeaders(origin);
   }
