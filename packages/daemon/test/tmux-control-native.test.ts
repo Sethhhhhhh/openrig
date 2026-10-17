@@ -78,9 +78,9 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     const connecting = spawned.length;
     for (const argv of reads) {
       // The spawned client lists the control session too; the control exec leaves its rows out, and only those.
-      const marked = ["tmux", ...markOwnRows(argv.slice(1), control.owner)];
+      const marked = ["tmux", ...markOwnRows(argv.slice(1), control.owner, "own-row:")];
       const expected = await outcome(execArgvCommand, marked) as { stdout?: string };
-      if (expected.stdout !== undefined) expected.stdout = withoutOwnRows(expected.stdout, control.owner);
+      if (expected.stdout !== undefined) expected.stdout = withoutOwnRows(expected.stdout, "own-row:");
       expect(await outcome(control, argv), argv.join(" ")).toEqual(expected);
     }
     // Every one of them went through the control client.
@@ -141,6 +141,18 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
       }
       await vi.waitFor(() => expect(sessions()).toEqual(["seat@rig"]), { timeout: 5000, interval: 50 });
     }
+  });
+
+  it("keeps every row and output that only reads like its own: a format or a later command printing its session's name", async () => {
+    await control(["tmux", "has-session", "-t", "=seat@rig"]);
+    const own = `${controlSessionName(control.owner)}:`;
+    expect(await control(["tmux", "list-sessions", "-F", `${own}#{session_name}`])).toBe(`${own}seat@rig\n`);
+    expect(await control(["tmux", "list-sessions", "-F", "#{session_name}", ";", "display-message", "-p", "-t", "=seat@rig:", `${own}x`]))
+      .toBe(`seat@rig\n${own}x\n`);
+    // A chain the spawned client runs (load-buffer is never routed) keeps them too.
+    writeFileSync(join(dir, "buffer.txt"), "b");
+    expect(await control(["tmux", "load-buffer", "-b", "own", join(dir, "buffer.txt"), ";", "list-sessions", "-F", `${own}#{session_name}`]))
+      .toBe(`${own}seat@rig\n`);
   });
 
   it("never takes over a session it did not make: one with its name, another daemon's, or one named openrig-control", async () => {

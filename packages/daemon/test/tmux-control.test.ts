@@ -2,7 +2,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import { commandsOf, ControlReplies, markOwnRows, supportsControlMode, tmuxControlExec, withoutOwnRows } from "../src/adapters/tmux-control.js";
+import { commandsOf, ControlReplies, markOwnRows, ownRowTag, supportsControlMode, tmuxControlExec, withoutOwnRows } from "../src/adapters/tmux-control.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 
 /** Replies expected for three commands; an answer says `overflow` only when its output went past the bound. */
@@ -102,6 +102,15 @@ function fakeClient(options: { attach?: boolean; checks?: string[][] } = {}) {
     child.emit("exit", null, "SIGTERM");
   }
   return { child: child as unknown as ChildProcessWithoutNullStreams, kill: child.kill, written, answer, attach, exit, ended: () => ended };
+}
+
+/** The tag a listing's own rows were marked with: the line is `before`, the owner d4e5's mark, then `after`. */
+function tagOf(line: string, before: string, after: string): string {
+  const own = "#{?#{==:#{@openrig-control},d4e5},";
+  expect(line.startsWith(`${before}${own}`) && line.endsWith(`,}${after}`), line).toBe(true);
+  const tag = line.slice(before.length + own.length, line.length - after.length - 2);
+  expect(tag).toMatch(/^[0-9a-f]{16}:$/);
+  return tag;
 }
 
 /** The spawned tmux the control exec falls back to: its own call (the server's version, read before a client starts)
@@ -458,12 +467,28 @@ describe("tmuxControlExec", () => {
     // The first call is a listing, and its client is made for it: the session it makes is left out already.
     const listing = exec(["tmux", "list-sessions", "-F", "#{session_name}"]);
     await vi.waitFor(() => expect(client.written).toHaveLength(1));
-    expect(client.written[0]).toBe("'list-sessions' '-F' '#{?#{==:#{@openrig-control},d4e5},openrig-control-d4e5:,}#{session_name}'");
-    client.answer("openrig-control-d4e5:openrig-control-d4e5", "seat@rig", "openrig-control", "openrig-control-other");
-    expect(await listing).toBe("seat@rig\nopenrig-control\nopenrig-control-other\n");
-    // A listing spawned (no -a: it would read the control client's own session) is marked as well.
+    const tag = tagOf(client.written[0]!, "'list-sessions' '-F' '", "#{session_name}'");
+    client.answer(`${tag}openrig-control-d4e5`, "seat@rig", "openrig-control", "openrig-control-d4e5:", "openrig-control-other");
+    expect(await listing).toBe("seat@rig\nopenrig-control\nopenrig-control-d4e5:\nopenrig-control-other\n");
+    // A listing spawned (no -a: it would read the control client's own session) is marked as well, with a tag of its own.
     expect(await exec(["tmux", "list-windows", "-F", "#{window_index}"])).toBe("");
-    expect(spawned).toEqual([["tmux", "list-windows", "-F", "#{?#{==:#{@openrig-control},d4e5},openrig-control-d4e5:,}#{window_index}"]]);
+    expect(tagOf(spawned[0]!.join(" "), "tmux list-windows -F ", "#{window_index}")).not.toBe(tag);
+    await exec.close();
+  });
+
+  it("drops only its own marked rows, from the listing that printed them: no other line, nor another command's output", async () => {
+    const client = fakeClient();
+    const { fallback } = fakeSpawned();
+    const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, owner: "d4e5", replyTimeoutMs: 1000 });
+    const chain = exec(["tmux", "list-sessions", "-F", "openrig-control-d4e5:#{session_name}", ";", "display-message", "-p", "-t", "=seat@rig:", "x"]);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1));
+    const tag = tagOf(client.written[0]!, "'list-sessions' '-F' '", "openrig-control-d4e5:#{session_name}'");
+    client.answer(`${tag}openrig-control-d4e5:openrig-control-d4e5`, "openrig-control-d4e5:seat@rig");
+    await vi.waitFor(() => expect(client.written).toHaveLength(2));
+    expect(client.written[1]).toBe("'display-message' '-p' '-t' '=seat@rig:' 'x'");
+    // Even a line that starts with the listing's tag is another command's output, and kept.
+    client.answer(`${tag}openrig-control-d4e5:x`, "openrig-control-d4e5:y");
+    expect(await chain).toBe(`openrig-control-d4e5:seat@rig\n${tag}openrig-control-d4e5:x\nopenrig-control-d4e5:y\n`);
     await exec.close();
   });
 });
@@ -504,14 +529,16 @@ describe("control-mode rules", () => {
   });
 
   it("marks its own rows in each listing's format, on its owner's mark, and drops only those rows", () => {
-    const own = "#{?#{==:#{@openrig-control},d4e5},openrig-control-d4e5:,}";
-    expect(markOwnRows(["list-sessions", "-F", "#{session_name}"], "d4e5")).toEqual(["list-sessions", "-F", `${own}#{session_name}`]);
-    expect(markOwnRows(["list-panes", "-a", "-F", "x"], "d4e5")).toEqual(["list-panes", "-a", "-F", `${own}x`]);
-    expect(markOwnRows(["list-clients", "-F", "x", ";", "list-windows", "-a", "-F", "y"], "d4e5"))
+    const own = "#{?#{==:#{@openrig-control},d4e5},t1:,}";
+    expect(markOwnRows(["list-sessions", "-F", "#{session_name}"], "d4e5", "t1:")).toEqual(["list-sessions", "-F", `${own}#{session_name}`]);
+    expect(markOwnRows(["list-panes", "-a", "-F", "x"], "d4e5", "t1:")).toEqual(["list-panes", "-a", "-F", `${own}x`]);
+    expect(markOwnRows(["list-clients", "-F", "x", ";", "list-windows", "-a", "-F", "y"], "d4e5", "t1:"))
       .toEqual(["list-clients", "-F", `${own}x`, ";", "list-windows", "-a", "-F", `${own}y`]);
-    expect(markOwnRows(["display-message", "-p", "-F", "x"], "d4e5")).toEqual(["display-message", "-p", "-F", "x"]);
-    expect(markOwnRows(["capture-pane", "-p", "-t", "=s:;", "list-sessions"], "d4e5")).toEqual(["capture-pane", "-p", "-t", "=s:;", "list-sessions"]);
-    expect(withoutOwnRows("openrig-control-d4e5:a\nb\nopenrig-control-d4e5:c\n", "d4e5")).toBe("b\n");
-    expect(withoutOwnRows("openrig-control-ffff:a\nopenrig-control\n", "d4e5")).toBe("openrig-control-ffff:a\nopenrig-control\n");
+    expect(markOwnRows(["display-message", "-p", "-F", "x"], "d4e5", "t1:")).toEqual(["display-message", "-p", "-F", "x"]);
+    expect(markOwnRows(["capture-pane", "-p", "-t", "=s:;", "list-sessions"], "d4e5", "t1:")).toEqual(["capture-pane", "-p", "-t", "=s:;", "list-sessions"]);
+    expect(withoutOwnRows("t1:a\nb\nt1:c\n", "t1:")).toBe("b\n");
+    expect(withoutOwnRows("openrig-control-d4e5:a\nt2:b\n", "t1:")).toBe("openrig-control-d4e5:a\nt2:b\n");
+    expect(ownRowTag()).toMatch(/^[0-9a-f]{16}:$/);
+    expect(ownRowTag()).not.toBe(ownRowTag());
   });
 });

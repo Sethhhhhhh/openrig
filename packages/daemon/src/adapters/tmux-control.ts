@@ -88,16 +88,16 @@ export function commandsOf(args: string[]): string[][] {
   return commands;
 }
 
-/** What starts each row a listing prints for this owner's own session, its windows, panes and client. */
-export function ownRowPrefix(owner: string): string {
-  return `${controlSessionName(owner)}:`;
+/** What starts each row a listing prints for the owner's own session, its windows, panes and client: drawn for each
+ *  call, so that no other row (whatever its format prints) and no other command's output starts with it. */
+export function ownRowTag(): string {
+  return `${randomBytes(8).toString("hex")}:`;
 }
 
-/** The argv with each listing's `-F` format starting its own rows (the owner's session's, and its client's) with
- *  `ownRowPrefix`, which `withoutOwnRows` then drops. No `-f` filter: one needs tmux 3.2 (3.4 for list-clients) of the
- *  server, which a client's own version does not tell. A format is all a row shows, so a listing without `-F` is left
- *  as is. */
-export function markOwnRows(args: string[], owner: string): string[] {
+/** The argv with each listing's `-F` format starting its own rows (the owner's session's, and its client's) with `tag`,
+ *  which `withoutOwnRows` then drops. No `-f` filter: one needs tmux 3.2 (3.4 for list-clients) of the server, which a
+ *  client's own version does not tell. A format is all a row shows, so a listing without `-F` is left as is. */
+export function markOwnRows(args: string[], owner: string, tag: string): string[] {
   let first = true;
   let listing = false;
   return args.map((arg, i) => {
@@ -106,18 +106,17 @@ export function markOwnRows(args: string[], owner: string): string[] {
       listing = LISTINGS.has(arg);
       first = false;
     } else if (listing && args[i - 1] === "-F" && !arg.endsWith(";")) {
-      out = `#{?#{==:#{${CONTROL_OPTION}},${owner}},${ownRowPrefix(owner)},}${arg}`;
+      out = `#{?#{==:#{${CONTROL_OPTION}},${owner}},${tag},}${arg}`;
     }
     if (arg.endsWith(";") && !arg.endsWith("\\;")) first = true;
     return out;
   });
 }
 
-/** A listing's output without the rows `markOwnRows` marked. */
-export function withoutOwnRows(stdout: string, owner: string): string {
-  const prefix = ownRowPrefix(owner);
-  if (!stdout.includes(prefix)) return stdout;
-  return stdout.split("\n").filter((line) => !line.startsWith(prefix)).join("\n");
+/** A listing's output without the rows `markOwnRows` marked with `tag`. */
+export function withoutOwnRows(stdout: string, tag: string): string {
+  if (!stdout.includes(tag)) return stdout;
+  return stdout.split("\n").filter((line) => !line.startsWith(tag)).join("\n");
 }
 
 /** One argument on a control-mode command line: in single quotes, where tmux expands nothing; a ' closes them, is
@@ -531,8 +530,9 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     // that lists, or by another one under way. A row is marked only on this daemon's own mark, so before its session
     // exists the output is unchanged.
     const marked = bin === "tmux" && commandsIn.some((c) => LISTINGS.has(c[0]!));
-    const argv = marked ? [bin, ...markOwnRows(argsIn, owner)] : argvIn;
-    const own = (text: string): string => marked ? withoutOwnRows(text, owner) : text;
+    const tag = marked ? ownRowTag() : "";
+    const argv = marked ? [bin, ...markOwnRows(argsIn, owner, tag)] : argvIn;
+    const own = (text: string): string => marked ? withoutOwnRows(text, tag) : text;
     const target = routable ? await connected() : null;
     if (!target) return own(await fallback(argv));
     target.users++;
@@ -552,7 +552,8 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
           if (written.some((c) => !READS.has(c[0]!))) throw await failedWrite(command, err as Error);
           return own(await fallback(argv));
         }
-        const text = own(reply.lines.length > 0 ? `${reply.lines.join("\n")}\n` : "");
+        const output = reply.lines.length > 0 ? `${reply.lines.join("\n")}\n` : "";
+        const text = LISTINGS.has(command[0]!) ? own(output) : output;
         // Past the bound, in this reply or in the chain's so far: the call fails as a spawned client's does, and the
         // rest of the chain is not sent.
         bytes += Buffer.byteLength(text);
