@@ -43,6 +43,9 @@ describe("ControlReplies", () => {
     r.expect({ resolve: () => {}, reject: (e) => errors.push(e.message) });
     r.failAll(new Error("gone"));
     expect(errors).toEqual(["gone"]);
+    r.expect({ resolve: () => {}, reject: (e) => errors.push(`later: ${e.message}`) });
+    expect(errors).toEqual(["gone", "later: gone"]);
+    expect(r.closed).toBe(true);
   });
 });
 
@@ -93,6 +96,27 @@ describe("tmuxControlExec", () => {
     client.answer("x");
     expect(await read).toBe("x\n");
     expect(spawned).toHaveLength(1);
+    exec.close();
+  });
+
+  it("fails a chain's write whose client ended after an earlier command, without writing the rest to it", async () => {
+    const client = fakeClient();
+    const spawned: string[][] = [];
+    const exec = tmuxControlExec(async (argv) => {
+      if (argv[1] === "-V") return "tmux 3.6\n";
+      if (argv[1] === "has-session") return "";
+      spawned.push(argv);
+      return "";
+    }, { spawnClient: () => client.child, replyTimeoutMs: 50 });
+
+    const chain = exec(["tmux", "load-buffer", "-b", "b1", "/tmp/x", ";", "paste-buffer", "-b", "b1", "-t", "=seat@rig:"]);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1));
+    // The client ends as soon as its reply to the first command is read, before the chain goes on.
+    client.child.stdout.once("data", () => (client.child as unknown as EventEmitter).emit("exit", null, "SIGTERM"));
+    client.answer();
+    await expect(chain).rejects.toThrow("before the command was written");
+    expect(client.written).toHaveLength(1);
+    expect(spawned).toEqual([]);
     exec.close();
   });
 });

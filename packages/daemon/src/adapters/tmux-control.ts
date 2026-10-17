@@ -84,10 +84,17 @@ export class ControlReplies {
   private readonly pending: Pending[] = [];
   /** The first block answers the attach itself, before any command was written. */
   private attached = false;
+  /** Set once the client is gone: nothing will be answered any more. */
+  private failure: Error | null = null;
   onAttached?: () => void;
 
+  get closed(): boolean {
+    return this.failure !== null;
+  }
+
   expect(pending: Pending): void {
-    this.pending.push(pending);
+    if (this.failure) pending.reject(this.failure);
+    else this.pending.push(pending);
   }
 
   push(chunk: string): void {
@@ -123,8 +130,9 @@ export class ControlReplies {
     this.lines.push(line);
   }
 
-  /** Fails every command still waiting: the client is gone, so none will be answered. */
+  /** Fails every command still waiting, and any expected later: the client is gone, so none will be answered. */
   failAll(error: Error): void {
+    this.failure ??= error;
     for (const p of this.pending.splice(0)) p.reject(error);
   }
 }
@@ -151,6 +159,8 @@ export interface TmuxControlOptions {
 }
 
 const RETRY_MS = [1_000, 5_000, 30_000];
+
+const NOT_WRITTEN = new Error("tmux control client ended before the command was written");
 
 interface ControlClient {
   child: ChildProcessWithoutNullStreams;
@@ -252,6 +262,11 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
    *  for input that may have landed. */
   const send = (target: ControlClient, args: string[], deadline: boolean): Promise<{ ok: boolean; lines: string[] }> =>
     new Promise((resolve, reject) => {
+      // A chain's client may have ended after an earlier command's reply: nothing is written to it.
+      if (target.replies.closed) {
+        reject(NOT_WRITTEN);
+        return;
+      }
       const timer = deadline ? setTimeout(() => reject(new Error(`tmux control client: no reply within ${replyTimeoutMs} ms`)), replyTimeoutMs) : undefined;
       target.replies.expect({
         resolve: (reply) => { clearTimeout(timer); resolve(reply); },
@@ -272,14 +287,14 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     const commands = commandsOf(argv.slice(1));
     const writes = commands.some((c) => c[0] === "send-keys" || c[0] === "paste-buffer" || c[0] === "load-buffer");
     let stdout = "";
-    for (const command of commands) {
+    for (const [index, command] of commands.entries()) {
       let reply: { ok: boolean; lines: string[] };
       try {
         reply = await send(target, command, !writes);
       } catch (err) {
-        // A read is asked again of a spawned client. A write fails only when its client ended before replying: it may
-        // have landed, so its failure is reported, never repeated.
-        if (writes) throw err;
+        // A read, or a call of which nothing was written, is run again by a spawned client. A write fails when its
+        // client ended after it was written: it may have landed, so its failure is reported, never repeated.
+        if (writes && !(err === NOT_WRITTEN && index === 0)) throw err;
         return fallback(argv);
       }
       const text = reply.lines.length > 0 ? `${reply.lines.join("\n")}\n` : "";
