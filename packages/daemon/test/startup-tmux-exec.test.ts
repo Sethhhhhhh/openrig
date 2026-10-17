@@ -38,10 +38,10 @@ describe("createDaemon tmux exec wiring", { timeout: 120000 }, () => {
       Object.defineProperty(process, "platform", { ...platform, value: host });
       const daemon = await createDaemon({ dbPath: ":memory:", cmuxFactory });
       try {
-        const exec = argvExecOf(daemon.deps.tmuxAdapter) as (ArgvExecFn & { close?: () => void }) | undefined;
+        const exec = argvExecOf(daemon.deps.tmuxAdapter) as (ArgvExecFn & { close?: () => Promise<void> }) | undefined;
         expect(exec).not.toBe(execArgvCommand);
         expect(typeof exec?.close).toBe("function");
-        exec?.close?.();
+        await daemon.deps.tmuxAdapter.closeControlClient();
       } finally {
         daemon.eventLoopMonitor.stop();
         daemon.db.close();

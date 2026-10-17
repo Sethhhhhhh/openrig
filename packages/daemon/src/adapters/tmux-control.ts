@@ -5,17 +5,34 @@ import type { ArgvExecFn } from "./tmux.js";
  * tmux commands over one long-lived control-mode client (`tmux -C`) instead of a new tmux client per command.
  *
  * Each spawned client costs the daemon a fork of its whole process: some 28 ms of CPU a command at its size, against
- * 0.3 ms for a line written to a client already connected. The client is attached to a session of its own, which the
- * daemon's listings leave out. What it runs and what it gives back are the spawned client's: the same command line,
- * the same stdout, the same error text in `execStderr`, a chain stopped at its first failing command. Anything else
- * (a launch, which takes the spawning process's environment; `load-buffer`, see ROUTED; a command line that cannot be
- * written on one line; a global flag; a tmux before 3.2; no server yet) goes to the spawned client, as before.
+ * 0.3 ms for a line written to a client already connected. The client is attached to a session of its own, marked with
+ * the `@openrig-control` option whatever it is named later, which the daemon's listings leave out and which it kills
+ * when it stops. What it runs and what it gives back are the spawned client's: the same commands, the same stdout, the
+ * same error text in `execStderr`, a chain stopped at its first failing command. A chain's commands are sent one after
+ * the other's reply, so another client's command may run between them, which it cannot in a spawned client's chain.
+ * Anything else (a launch, which takes the spawning process's environment; `load-buffer`, see ROUTED; a command line
+ * that cannot be written on one line; a global flag; a tmux before 3.2; no server yet) goes to the spawned client, as
+ * before.
  */
 
 export const CONTROL_SESSION = "openrig-control";
 
+/** The session option that marks the control session, set as it is made: a rename keeps it. */
+export const CONTROL_OPTION = "@openrig-control";
+
+/** True in the control session (its windows and panes too): a format a listing's field or filter tests. Any tmux
+ *  expands an unset user option to nothing, so it holds on a tmux this client never runs on. */
+export const IS_CONTROL_SESSION = `#{==:#{${CONTROL_OPTION}},1}`;
+
 /** Leaves the control session out of a listing (tmux 3.2 and later). */
-const NOT_CONTROL_SESSION = `#{!=:#{session_name},${CONTROL_SESSION}}`;
+const NOT_CONTROL_SESSION = `#{!=:#{${CONTROL_OPTION}},1}`;
+
+/** What the control session's pane runs, exec'd as argv (no `default-shell -c`, so no shell of the user's and none of
+ *  its rc files): a non-interactive sh that waits forever. */
+const KEEP_ALIVE = ["sh", "-c", "while :; do sleep 86400; done"];
+
+/** How long the daemon's stop waits for the control session to be killed. */
+const CLOSE_MS = 2_000;
 
 // Commands that only read the server or write into a pane, whose outcome does not depend on the client that sends
 // them as long as they name their target. A launch or an environment change stays spawned. So does `load-buffer`: it
@@ -187,7 +204,9 @@ interface ControlClient {
  * The ArgvExecFn the daemon's TmuxAdapter runs with: routed commands go to the control client, every other one, or any
  * while the client cannot run, to `fallback` (the spawned client).
  */
-export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOptions = {}): ArgvExecFn & { close: () => void } {
+export type TmuxControlExec = ArgvExecFn & { close: () => Promise<void> };
+
+export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOptions = {}): TmuxControlExec {
   const spawnClient = options.spawnClient ?? (() => spawn("tmux", ["-C", "attach-session", "-t", `=${CONTROL_SESSION}`, "-f", "no-output,ignore-size"], {
     stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
   }));
@@ -209,21 +228,31 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     child.kill();
   };
 
-  /** The control session, made when the server runs without it; false when there is no server to make it on. */
-  const ensureSession = async (): Promise<boolean> => {
+  /** The control session's id on the server it was last made or marked on, which the daemon's stop kills. */
+  let sessionId: string | null = null;
+  let closed = false;
+
+  /** The control session, made when the server runs without it, and marked (one an older daemon made is marked too):
+   *  its id, or null when there is no server to make it on. It never moves a client that is in it elsewhere when it
+   *  is killed (`detach-on-destroy on`). */
+  const ensureSession = async (): Promise<string | null> => {
+    const target = `=${CONTROL_SESSION}:`;
+    const mark = ["set-option", "-t", target, CONTROL_OPTION, "1", ";", "set-option", "-t", target, "detach-on-destroy", "on",
+      ";", "display-message", "-p", "-t", target, "#{session_id}"];
     try {
-      await fallback(["tmux", "has-session", "-t", `=${CONTROL_SESSION}`]);
-      return true;
+      return (await fallback(["tmux", ...mark])).trim();
     } catch (err) {
-      const text = String((err as Error).message);
-      if (!/can't find session|session not found/i.test(text)) return false;
+      if (!/can't find session|no such session|session not found/i.test(String((err as Error).message))) return null;
     }
     try {
-      // A shell would read the user's rc files; this waits forever on anything with a sleep.
-      await fallback(["tmux", "new-session", "-d", "-s", CONTROL_SESSION, "-x", "80", "-y", "24", "sh -c 'while :; do sleep 86400; done'"]);
-      return true;
+      return (await fallback(["tmux", "new-session", "-d", "-s", CONTROL_SESSION, "-x", "80", "-y", "24", "--", ...KEEP_ALIVE, ";", ...mark])).trim();
     } catch (err) {
-      return /duplicate session/.test(String((err as Error).message));
+      if (!/duplicate session/.test(String((err as Error).message))) return null;
+    }
+    try {
+      return (await fallback(["tmux", ...mark])).trim();
+    } catch {
+      return null;
     }
   };
 
@@ -235,10 +264,14 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
         return null; // tmux could not even say its version: asked again later.
       }
     }
-    if (!supported || !(await ensureSession())) {
+    if (!supported) return null;
+    const id = await ensureSession();
+    if (id === null) {
       retryAt = now() + RETRY_MS[RETRY_MS.length - 1]!;
       return null;
     }
+    sessionId = id;
+    if (closed) return null;
     const child = spawnClient();
     const replies = new ControlReplies();
     child.stdout.setEncoding("utf8");
@@ -255,17 +288,17 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       replies.onAttached = () => { clearTimeout(timer); resolve(true); };
       child.once("exit", () => { clearTimeout(timer); resolve(false); });
     });
-    if (!attached) {
-      client = { child, replies };
-      drop(child, "did not attach");
+    client = { child, replies };
+    if (!attached || closed) {
+      drop(child, closed ? "closed" : "did not attach");
       return null;
     }
     failures = 0;
-    client = { child, replies };
     return client;
   };
 
   const connected = async (): Promise<ControlClient | null> => {
+    if (closed) return null;
     if (client) return client;
     if (supported === false || now() < retryAt) return null;
     starting ??= start().finally(() => { starting = null; });
@@ -321,7 +354,18 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     return stdout;
   };
 
-  return Object.assign(exec, {
-    close: () => { if (client) { const { child } = client; client.replies.failAll(new Error("tmux control client closed")); client = null; child.kill(); } },
-  });
+  /** Ends the client, one being started included, and kills its session: the daemon is stopping. The kill names the
+   *  session by id and checks its mark first, so a session that took the id on a newer server is left alone. */
+  const close = async (): Promise<void> => {
+    closed = true;
+    await starting;
+    if (client) drop(client.child, "closed");
+    if (sessionId === null) return;
+    const kill = fallback(["tmux", "if-shell", "-F", "-t", sessionId, IS_CONTROL_SESSION, `kill-session -t '${sessionId}'`]).catch(() => "");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([kill, new Promise((resolve) => { timer = setTimeout(resolve, CLOSE_MS); })]);
+    clearTimeout(timer);
+  };
+
+  return Object.assign(exec, { close });
 }
