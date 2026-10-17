@@ -151,6 +151,16 @@ describe("queue list: delivery ledgers", () => {
     prepare.mockRestore();
   });
 
+  it("reads a row's latest owner notification and its latest outbound one, not its whole history", async () => {
+    const id = await create("human-founder@external", { humanIntent: "decision" });
+    const insert = db.prepare(`INSERT INTO queue_transitions (qitem_id, ts, state, transition_note, actor_session, owner_notification_kind, owner_notification_level)
+      VALUES (?, ?, 'pending', ?, 'lead@rig', ?, 'ALERT')`);
+    for (let n = 0; n < 6; n++) insert.run(id, new Date().toISOString(), `notice ${n}`, n % 2 ? "human-decision-resolved" : "human-required");
+    const owners = repo.transitionLog.ownerNotificationsForQitems([id]).get(id)!;
+    expect(owners.map((t) => t.transitionNote)).toEqual(["notice 5", "notice 4"]);
+    expect(owners[0]).toEqual(repo.transitionLog.latestOwnerNotificationForQitem(id));
+  });
+
   it("tells a full row's waiting view its ask was posted to its human, as the row alone does", async () => {
     await seed();
     const listed = repo.list({ limit: 1000 }).filter((item) => item.state === "pending");
