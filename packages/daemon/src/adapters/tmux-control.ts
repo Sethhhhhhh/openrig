@@ -1,6 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { spawnTmuxClient } from "./tmux-exec.js";
+import { spawnTmuxClient, TMUX_MAX_BUFFER } from "./tmux-exec.js";
 import type { ArgvExecFn } from "./tmux.js";
 
 /**
@@ -15,11 +15,13 @@ import type { ArgvExecFn } from "./tmux.js";
  * never kills a session itself. Listings leave out this daemon's own session and client, and nothing else: a session
  * another daemon or a person made, whatever its name or mark, is listed as any other.
  *
- * What it runs and what it gives back are the spawned client's: the same commands, the same output, the same error
- * text in `execStderr`, a chain stopped at its first failing command. Two differences: a chain's commands are sent one
- * after the other's reply, so another client's command may run between them, which it cannot in a spawned client's
- * chain; and the blocks tmux's hooks print on their own (an `after-list-panes` in a user's tmux.conf) are not taken
- * for a command's reply, where a spawned client prints a hook's output after its command's. Anything else (a launch,
+ * What it runs and what it gives back are the spawned client's: the same commands, their output, the same error text
+ * in `execStderr`, a chain stopped at its first failing command, and output past TMUX_MAX_BUFFER failed with execFile's
+ * `maxBuffer length exceeded`. The differences: a chain's commands are sent one after the other's reply, so another
+ * client's command may run between them, which it cannot in a spawned client's chain; a client that ends partway
+ * through a chain fails the rest at once, the outcome of the commands it sent unknown, and none is run again; and the
+ * blocks tmux's hooks print on their own (an `after-list-panes` in a user's tmux.conf) are not taken for a command's
+ * reply, where a spawned client prints a hook's output after its command's. Anything else (a launch,
  * which takes the spawning process's environment; `load-buffer`, see ROUTED; a command line that cannot be written on
  * one line; a global flag; no server yet, or one before 3.2) goes to the spawned client, as before.
  */
@@ -133,8 +135,15 @@ export function supportsControlMode(versionLine: string): boolean {
   return major > 3 || (major === 3 && Number(match[2]) >= 2);
 }
 
+/** A command's reply: its output lines, none once they went past the bound (`overflow`). */
+interface Reply {
+  ok: boolean;
+  lines: string[];
+  overflow: boolean;
+}
+
 interface Pending {
-  resolve: (reply: { ok: boolean; lines: string[] }) => void;
+  resolve: (reply: Reply) => void;
   reject: (error: Error) => void;
 }
 
@@ -142,11 +151,18 @@ interface Pending {
  *  the order the commands were written. A block ends only on the line that repeats its own `%begin` header, so a pane
  *  line reading `%end …` never ends it. Only a block whose flags (the header's third field) say the client sent the
  *  command answers one: a hook (`after-list-panes` in a user's tmux.conf) prints its own blocks, flagged 0, between
- *  them, and those are no command's reply. */
+ *  them, and those are no command's reply. A reply keeps at most `maxBytes` of output, as a spawned client's stdout is
+ *  bounded (TMUX_MAX_BUFFER): past it, its lines are dropped as they come, up to its end, so every later reply is still
+ *  its own command's, and it is answered as overflowed. A line with no end yet is bounded the same way. */
 export class ControlReplies {
   private partial = "";
+  /** Set while the rest of a line past the bound is dropped, up to its newline. */
+  private skipping = false;
   private header: string | null = null;
   private lines: string[] = [];
+  /** The bytes of the block being read, and whether they went past the bound. */
+  private bytes = 0;
+  private overflow = false;
   private readonly pending: Pending[] = [];
   /** The first block answers the client's own `new-session`, before any command was written. */
   private attached = false;
@@ -158,6 +174,8 @@ export class ControlReplies {
   onReply?: () => void;
   /** Called on tmux's `%sessions-changed`: a session was made or destroyed on the server. */
   onSessionsChanged?: () => void;
+
+  constructor(private readonly maxBytes: number = TMUX_MAX_BUFFER) {}
 
   get closed(): boolean {
     return this.failure !== null;
@@ -177,9 +195,23 @@ export class ControlReplies {
     this.partial += chunk;
     let newline: number;
     while ((newline = this.partial.indexOf("\n")) >= 0) {
-      this.line(this.partial.slice(0, newline).replace(/\r$/, ""));
+      const line = this.partial.slice(0, newline).replace(/\r$/, "");
       this.partial = this.partial.slice(newline + 1);
+      if (this.skipping) this.skipping = false;
+      else this.line(line);
     }
+    if (this.partial.length > this.maxBytes) {
+      this.partial = "";
+      this.skipping = true;
+      this.overflowed();
+    }
+  }
+
+  /** Drops the block's output once past the bound: only that it overflowed is kept. */
+  private overflowed(): void {
+    if (this.header === null) return;
+    this.overflow = true;
+    this.lines = [];
   }
 
   private line(line: string): void {
@@ -187,6 +219,8 @@ export class ControlReplies {
       if (line.startsWith("%begin ")) {
         this.header = line.slice("%begin ".length);
         this.lines = [];
+        this.bytes = 0;
+        this.overflow = false;
       } else if (line === "%sessions-changed") {
         this.onSessionsChanged?.();
       }
@@ -202,11 +236,14 @@ export class ControlReplies {
         return;
       }
       if ((flags & 1) === 0) return;
-      this.pending.shift()?.resolve({ ok, lines: this.lines });
+      this.pending.shift()?.resolve({ ok, lines: this.lines, overflow: this.overflow });
       this.onReply?.();
       return;
     }
-    this.lines.push(line);
+    if (this.overflow) return;
+    this.bytes += Buffer.byteLength(line) + 1;
+    if (this.bytes > this.maxBytes) this.overflowed();
+    else this.lines.push(line);
   }
 
   /** Fails every command still waiting, and any expected later: the client is gone, so none will be answered. */
@@ -226,6 +263,14 @@ function commandFailed(argv: string[], stdout: string, stderr: string): Error {
   });
 }
 
+/** The error a spawned client's call fails with once its stdout is past its bound (execFile's maxBuffer): the same
+ *  first line, which callers match (`capturePanesContent` splits its chain on it), and tmux's stderr empty. */
+function outputTooLarge(stdout: string): Error {
+  return Object.assign(new RangeError("stdout maxBuffer length exceeded"), {
+    code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER", stdout, stderr: "", execStderr: "",
+  });
+}
+
 /** Starts the control client with these tmux arguments (`spawnTmuxClient`); tests give their own. */
 export type SpawnControlClient = (args: string[]) => ChildProcessWithoutNullStreams | Promise<ChildProcessWithoutNullStreams>;
 
@@ -238,6 +283,8 @@ export interface TmuxControlOptions {
   now?: () => number;
   /** This daemon's id on a tmux server: its control session's name and mark. A random one by default. */
   owner?: string;
+  /** The most output a call may give, as a spawned client's stdout is bounded: TMUX_MAX_BUFFER by default. */
+  maxBuffer?: number;
 }
 
 const RETRY_MS = [1_000, 5_000, 30_000];
@@ -270,6 +317,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
   const owner = options.owner ?? randomBytes(4).toString("hex");
   const spawnClient = options.spawnClient ?? spawnTmuxClient;
   const replyTimeoutMs = options.replyTimeoutMs ?? 10_000;
+  const maxBuffer = options.maxBuffer ?? TMUX_MAX_BUFFER;
   const now = options.now ?? (() => Date.now());
   let client: ControlClient | null = null;
   let starting: Promise<ControlClient | null> | null = null;
@@ -375,7 +423,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       backOff(); // tmux could not be started at all: asked again later, not at every command.
       return null;
     }
-    const replies = new ControlReplies();
+    const replies = new ControlReplies(maxBuffer);
     const started: ControlClient = { child, replies, headSince: 0, users: 0, retiring: false };
     live.add(started);
     replies.onReply = () => {
@@ -395,6 +443,8 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       drop(started, `exited (${signal ?? code})`);
     });
     child.stdin.on("error", (err) => drop(started, err.message));
+    // Its output closed, nothing will be answered: what it owes settles now, not at its reply timeout.
+    child.stdout.on("close", () => drop(started, "its output closed"));
     // The daemon's exit is never held by its control client.
     child.unref();
     for (const stream of [child.stdin, child.stdout, child.stderr] as unknown[]) (stream as { unref?: () => void }).unref?.();
@@ -434,7 +484,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
 
   /** One command's reply, or the client's end: the whole line is failed when its head waits too long (`watch`), so no
    *  command waits behind a client that stopped answering, and every reply stays its own command's. */
-  const send = (target: ControlClient, args: string[]): Promise<{ ok: boolean; lines: string[] }> =>
+  const send = (target: ControlClient, args: string[]): Promise<Reply> =>
     new Promise((resolve, reject) => {
       // A chain's client may have ended after an earlier command's reply, or be ending: nothing is written to it.
       if (target.replies.closed || target.child.stdin.writableEnded) {
@@ -453,7 +503,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
   const checkAlone = (c: ControlClient): void => {
     if (client !== c) return;
     send(c, ["list-sessions", "-F", `#{${CONTROL_OPTION}}`]).then((reply) => {
-      if (reply.ok && reply.lines.every((line) => line !== "")) retire(c);
+      if (reply.ok && !reply.overflow && reply.lines.every((line) => line !== "")) retire(c);
     }, () => { /* the client is gone already */ });
   };
 
@@ -490,8 +540,9 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     try {
       const commands = commandsOf(argv.slice(1));
       let stdout = "";
+      let bytes = 0;
       for (const [index, command] of commands.entries()) {
-        let reply: { ok: boolean; lines: string[] };
+        let reply: Reply;
         try {
           reply = await send(target, command);
         } catch (err) {
@@ -503,6 +554,10 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
           return own(await fallback(argv));
         }
         const text = own(reply.lines.length > 0 ? `${reply.lines.join("\n")}\n` : "");
+        // Past the bound, in this reply or in the chain's so far: the call fails as a spawned client's does, and the
+        // rest of the chain is not sent.
+        bytes += Buffer.byteLength(text);
+        if (reply.overflow || bytes > maxBuffer) throw outputTooLarge(stdout);
         if (!reply.ok) throw commandFailed(argvIn, stdout, text);
         stdout += text;
       }

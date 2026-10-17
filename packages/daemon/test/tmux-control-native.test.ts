@@ -201,6 +201,29 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     await next.close();
   });
 
+  it("fails a chain past its output bound as a spawned client does, so a batched capture splits it and reads every pane", async () => {
+    tmux("new-session", "-d", "-s", "two@rig", "-x", "120", "-y", "30", `cat ${join(dir, "screen.txt")}; exec cat`);
+    await sleep(300);
+    const mark = `__openrig_capture_${"0".repeat(32)}_0__`;
+    const one = await execArgvCommand(["tmux", "display-message", "-p", "-t", "=seat@rig:", mark, ";", "capture-pane", "-p", "-t", "=seat@rig:", "-S", "-20"]);
+    // One pane's chunk fits; two do not.
+    const bounded = tmuxControlExec(execArgvCommand, { maxBuffer: Math.floor(Buffer.byteLength(one) * 1.5) });
+    try {
+      await bounded(["tmux", "has-session", "-t", "=seat@rig"]);
+      const pair = ["tmux", "display-message", "-p", "-t", "=seat@rig:", mark, ";", "capture-pane", "-p", "-t", "=seat@rig:", "-S", "-20",
+        ";", "display-message", "-p", "-t", "=two@rig:", mark, ";", "capture-pane", "-p", "-t", "=two@rig:", "-S", "-20"];
+      await expect(bounded(pair)).rejects.toThrow(/^stdout maxBuffer length exceeded/);
+      const captured = await new TmuxAdapter(async () => "", undefined, bounded).capturePanesContent(["seat@rig", "two@rig"], 20);
+      const expected = await new TmuxAdapter(async () => "", undefined, execArgvCommand).capturePanesContent(["seat@rig", "two@rig"], 20);
+      const texts = (m: typeof captured) => [...(m ?? new Map()).entries()].map(([t, c]) => [t, c.text]).sort();
+      expect(texts(captured)).toEqual(texts(expected));
+      expect(texts(captured)).toHaveLength(2);
+      expect(texts(captured).every(([, text]) => typeof text === "string" && text.includes("last line"))).toBe(true);
+    } finally {
+      await bounded.close();
+    }
+  });
+
   it("runs its keep-alive without a shell of the user's: what default-shell names is never started", async () => {
     const shell = join(dir, "shell.sh");
     writeFileSync(shell, `#!/bin/sh\ntouch ${join(dir, "shell-ran")}\nexec sh "$@"\n`, { mode: 0o755 });

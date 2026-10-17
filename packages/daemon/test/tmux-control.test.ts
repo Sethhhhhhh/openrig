@@ -5,12 +5,15 @@ import { describe, expect, it, vi } from "vitest";
 import { commandsOf, ControlReplies, markOwnRows, supportsControlMode, tmuxControlExec, withoutOwnRows } from "../src/adapters/tmux-control.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 
-function replies(): { replies: ControlReplies; answers: Array<{ ok: boolean; lines: string[] }>; attached: () => boolean } {
-  const r = new ControlReplies();
-  const answers: Array<{ ok: boolean; lines: string[] }> = [];
+/** Replies expected for three commands; an answer says `overflow` only when its output went past the bound. */
+function replies(maxBytes?: number): { replies: ControlReplies; answers: Array<{ ok: boolean; lines: string[]; overflow?: true }>; attached: () => boolean } {
+  const r = new ControlReplies(maxBytes);
+  const answers: Array<{ ok: boolean; lines: string[]; overflow?: true }> = [];
   let attached = false;
   r.onAttached = () => { attached = true; };
-  for (let i = 0; i < 3; i++) r.expect({ resolve: (a) => answers.push(a), reject: () => {} });
+  for (let i = 0; i < 3; i++) {
+    r.expect({ resolve: (a) => answers.push(a.overflow ? { ok: a.ok, lines: a.lines, overflow: true } : { ok: a.ok, lines: a.lines }), reject: () => {} });
+  }
   return { replies: r, answers, attached: () => attached };
 }
 
@@ -36,6 +39,21 @@ describe("ControlReplies", () => {
     r.push("%begin 1 12 1\n%0\n%end 1 12 1\n%begin 1 13 0\nhook-output\nhook-output\n%end 1 13 0\n");
     r.push("%begin 1 14 1\nb1\n%end 1 14 1\n%begin 1 15 0\ncan't find pane\n%error 1 15 0\n%begin 1 16 1\nb2\n%end 1 16 1\n");
     expect(answers).toEqual([{ ok: true, lines: ["%0"] }, { ok: true, lines: ["b1"] }, { ok: true, lines: ["b2"] }]);
+  });
+
+  it("keeps a reply's output within its bound, reads through to its end, and answers the next command as its own", () => {
+    const { replies: r, answers } = replies(10);
+    r.push("%begin 1 1 0\n%end 1 1 0\n");
+    r.push("%begin 1 2 1\n12345\n67890\nabc\n%end 1 2 1\n%begin 1 3 1\nok\n%end 1 3 1\n%begin 1 4 1\n123456789\n%end 1 4 1\n");
+    expect(answers).toEqual([{ ok: true, lines: [], overflow: true }, { ok: true, lines: ["ok"] }, { ok: true, lines: ["123456789"] }]);
+  });
+
+  it("bounds a line with no end yet: past the bound it is dropped as it comes, up to its newline", () => {
+    const { replies: r, answers } = replies(10);
+    r.push("%begin 1 1 0\n%end 1 1 0\n%begin 1 2 1\n");
+    for (let i = 0; i < 5; i++) r.push("x".repeat(8));
+    r.push("xx\n%end 1 2 1\n%begin 1 3 1\nok\n%end 1 3 1\n");
+    expect(answers).toEqual([{ ok: true, lines: [], overflow: true }, { ok: true, lines: ["ok"] }]);
   });
 
   it("fails what is still waiting when the client is gone", () => {
@@ -313,6 +331,44 @@ describe("tmuxControlExec", () => {
     expect(spawned).toHaveLength(2);
     expect(started).toBe(1);
     expect(client.written).toEqual([]);
+  });
+
+  it("fails a call past its output bound as a spawned client does, in one reply or across a chain, and stops the chain", async () => {
+    const client = fakeClient();
+    const { spawned, fallback } = fakeSpawned();
+    const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, replyTimeoutMs: 1000, maxBuffer: 16 });
+    const firstLine = (err: Error & { execStderr?: string }) => [err.message.split("\n")[0], err.execStderr];
+    const big = exec(["tmux", "capture-pane", "-p", "-t", "=s:"]).then(() => null, firstLine);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1));
+    client.answer("x".repeat(20));
+    expect(await big).toEqual(["stdout maxBuffer length exceeded", ""]);
+    // 10 bytes, then 10 more: past 16 in all, so the third command is never sent.
+    const chain = exec(["tmux", "capture-pane", "-p", "-t", "=a:", ";", "capture-pane", "-p", "-t", "=b:", ";", "capture-pane", "-p", "-t", "=c:"])
+      .then(() => null, firstLine);
+    await vi.waitFor(() => expect(client.written).toHaveLength(2));
+    client.answer("a".repeat(9));
+    await vi.waitFor(() => expect(client.written).toHaveLength(3));
+    client.answer("b".repeat(9));
+    expect(await chain).toEqual(["stdout maxBuffer length exceeded", ""]);
+    expect(client.written).toHaveLength(3);
+    // The next call still gets its own reply.
+    const read = exec(["tmux", "display-message", "-p", "-t", "=s:", "x"]);
+    await vi.waitFor(() => expect(client.written).toHaveLength(4));
+    client.answer("x");
+    expect(await read).toBe("x\n");
+    expect(spawned).toEqual([]);
+    await exec.close();
+  });
+
+  it("settles what its client owes as soon as the client's output closes", async () => {
+    const client = fakeClient();
+    const { fallback } = fakeSpawned(() => "spawned\n");
+    const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, replyTimeoutMs: 60_000 });
+    const read = exec(["tmux", "display-message", "-p", "-t", "=s:", "x"]);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1));
+    client.child.stdout.end();
+    expect(await read).toBe("spawned\n");
+    await exec.close();
   });
 
   it("settles its attach at once on a spawn error, spawns the call, and starts no client again for a while", async () => {
