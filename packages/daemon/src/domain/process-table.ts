@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { readdir } from "node:fs/promises";
 import { promisify } from "node:util";
+import { Worker } from "node:worker_threads";
 
 const execFileAsync = promisify(execFile);
 
@@ -74,47 +73,110 @@ function printable(bytes: string): string {
   return bytes.replace(/[\u0000-\u001f\u007f]/g, ".").replace(/[\u0080-\u00ff]/g, "?");
 }
 
-/** Pids read between two turns of the event loop: some 2 ms of reads at ~40 µs a pid. */
-const PIDS_PER_SLICE = 50;
+/** A file read under /proc: its bytes one character a byte (so names are cut and printed on bytes as ps does), or the
+ *  code of the error that kept it from being read. */
+type ProcFile = string | { code: string };
 
-const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+/** Part of a /proc's table, as the reader sends it: the boot time, then pids with their stat and cmdline (null once
+ *  the stat could not be read). The last part is `done`; a read that failed whole sends its error instead. */
+type ProcPart =
+  | { id: number; bootTime: number; files: Array<[pid: string, stat: ProcFile, cmdline: ProcFile | null]>; done: boolean }
+  | { id: number; error: string };
 
-/** The process table read from /proc (`root` for tests): the rows ps would print, without a process of its own. Each
- *  pid's two files are read synchronously, where as many asynchronous reads cost ten times that in the thread pool, as
- *  much CPU as the `ps` they replace; but the listing is asynchronous and the event loop is handed back every
- *  PIDS_PER_SLICE pids, so a host with thousands of processes never stalls the daemon for the whole table. */
-export async function readProcTable(root = "/proc"): Promise<ProcessTableRow[]> {
-  const pids = (await readdir(root)).filter((entry) => /^\d+$/.test(entry));
-  const bootTime = Number(/^btime (\d+)$/m.exec(readFileSync(`${root}/stat`, "utf8"))?.[1]);
-  if (!Number.isFinite(bootTime)) throw new Error(`${root}/stat has no btime`);
-  const rows: ProcessTableRow[] = [];
-  for (let i = 0; i < pids.length; i++) {
-    if (i > 0 && i % PIDS_PER_SLICE === 0) await nextTurn();
-    const row = readProcRow(root, pids[i]!, bootTime);
-    if (row) rows.push(row);
+// The reader's thread. It reads every file synchronously, the cheapest way: as many asynchronous reads cost ten times
+// that in the thread pool, as much CPU as the `ps` they replace. A file is read as UTF-8, Node's one native call, and
+// read again one character a byte only when it holds a byte that is no UTF-8 (rare). The table is sent in parts of
+// PIDS_PER_PART pids, so the event loop parses it a part at a time.
+const READER_SOURCE = String.raw`
+  const fs = require("node:fs");
+  const { parentPort } = require("node:worker_threads");
+  const PIDS_PER_PART = 100;
+
+  function read(file) {
+    try {
+      const text = fs.readFileSync(file, "utf8");
+      if (!/[^\x00-\x7f]/.test(text)) return text;
+      return text.includes("�") ? fs.readFileSync(file, "latin1") : Buffer.from(text, "utf8").toString("latin1");
+    } catch (error) {
+      return { code: String(error.code) };
+    }
   }
-  return rows;
+
+  parentPort.on("message", ({ id, root }) => {
+    try {
+      const bootTime = Number(/^btime (\d+)$/m.exec(fs.readFileSync(root + "/stat", "utf8"))?.[1]);
+      if (!Number.isFinite(bootTime)) throw new Error(root + "/stat has no btime");
+      const pids = fs.readdirSync(root).filter((entry) => /^\d+$/.test(entry));
+      for (let start = 0; start === 0 || start < pids.length; start += PIDS_PER_PART) {
+        const files = pids.slice(start, start + PIDS_PER_PART).map((pid) => {
+          const stat = read(root + "/" + pid + "/stat");
+          return [pid, stat, typeof stat === "string" ? read(root + "/" + pid + "/cmdline") : null];
+        });
+        parentPort.postMessage({ id, bootTime, files, done: start + PIDS_PER_PART >= pids.length });
+      }
+    } catch (error) {
+      parentPort.postMessage({ id, error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+`;
+
+let reader: Worker | null = null;
+let lastAsk = 0;
+const asked = new Map<number, { rows: ProcessTableRow[]; resolve: (rows: ProcessTableRow[]) => void; reject: (error: Error) => void }>();
+
+/** The process table read from /proc (`root` for tests): the rows ps would print, without a process of its own. The
+ *  files are read on the reader's thread: a read that waits (a cmdline waits on its process's memory lock) holds that
+ *  thread, never the daemon's event loop, which only parses what it is sent. */
+export function readProcTable(root = "/proc"): Promise<ProcessTableRow[]> {
+  const worker = reader ??= startReader();
+  const id = ++lastAsk;
+  // Idle, the reader keeps no process up; while an answer is owed it does.
+  worker.ref();
+  return new Promise((resolve, reject) => {
+    asked.set(id, { rows: [], resolve, reject });
+    worker.postMessage({ id, root });
+  });
+}
+
+function startReader(): Worker {
+  const worker = new Worker(READER_SOURCE, { eval: true, execArgv: [] });
+  worker.unref();
+  worker.on("message", (part: ProcPart) => {
+    const ask = asked.get(part.id);
+    if (!ask) return;
+    if ("files" in part) {
+      for (const [pid, stat, cmdline] of part.files) {
+        const row = procRow(pid, stat, cmdline, part.bootTime);
+        if (row) ask.rows.push(row);
+      }
+      if (!part.done) return;
+    }
+    asked.delete(part.id);
+    if (asked.size === 0) worker.unref();
+    if ("files" in part) ask.resolve(ask.rows);
+    else ask.reject(new Error(part.error));
+  });
+  // A reader lost fails what it owed; the next read starts another.
+  const lost = (error: Error) => {
+    if (reader === worker) reader = null;
+    for (const ask of asked.values()) ask.reject(error);
+    asked.clear();
+  };
+  worker.on("error", lost);
+  worker.on("exit", (code) => lost(new Error(`the /proc reader exited with code ${code}`)));
+  return worker;
 }
 
 /** The errors of a read under /proc/<pid> once the process has exited. */
 const PROCESS_GONE = new Set(["ENOENT", "ESRCH"]);
 
-function readProcRow(root: string, pid: string, bootTime: number): ProcessTableRow | null {
-  let stat: string;
-  try {
-    // latin1: one character a byte, so names are cut and printed on bytes as ps does.
-    stat = readFileSync(`${root}/${pid}/stat`, "latin1");
-  } catch {
-    return null; // exited between the listing and the read; without its stat ps lists nothing of it either
-  }
-  let cmdline = "";
-  try {
-    cmdline = readFileSync(`${root}/${pid}/cmdline`, "latin1");
-  } catch (error) {
-    // Only a process that is gone is dropped. One whose command line cannot be read (denied, say) is still running,
-    // and its foreground still counts: ps lists it by its name in brackets.
-    if (PROCESS_GONE.has((error as NodeJS.ErrnoException).code ?? "")) return null;
-  }
+function procRow(pid: string, stat: ProcFile, cmdlineFile: ProcFile | null, bootTime: number): ProcessTableRow | null {
+  // Exited between the listing and the read; without its stat ps lists nothing of it either.
+  if (typeof stat !== "string" || cmdlineFile === null) return null;
+  // Only a process that is gone is dropped. One whose command line cannot be read (denied, say) is still running, and
+  // its foreground still counts: ps lists it by its name in brackets.
+  if (typeof cmdlineFile !== "string" && PROCESS_GONE.has(cmdlineFile.code)) return null;
+  const cmdline = typeof cmdlineFile === "string" ? cmdlineFile : "";
   // `pid (comm) state ppid pgrp session tty_nr tpgid …`: comm may hold spaces and parentheses, so fields count from
   // its last `)`; the start time is the 22nd field, in ticks since boot.
   const close = stat.lastIndexOf(")");

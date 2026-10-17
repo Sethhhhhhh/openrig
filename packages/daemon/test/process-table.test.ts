@@ -1,13 +1,8 @@
 import { execFileSync } from "node:child_process";
-import fs, { readFileSync } from "node:fs";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-// readFileSync passes through, watched by the slicing test.
-vi.mock("node:fs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, default: actual, readFileSync: vi.fn(actual.readFileSync) };
-});
 import { readProcessTable, readProcTable } from "../src/domain/process-table.js";
 import { claudeCommandSessionToken, listNativeProcesses, processArgv, verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";
 import { defaultListProcessesStrict } from "../src/domain/resume-metadata-refresher.js";
@@ -78,25 +73,22 @@ describe("readProcTable", () => {
     expect(claudeCommandSessionToken(row!.command)).toBeNull();
   });
 
-  it("hands the event loop back while it lists, then every 50 pids, so a large table never blocks it whole", async () => {
-    const pids = Array.from({ length: 120 }, (_, i) => i + 1);
-    const root = fakeProc(0, Object.fromEntries(pids.map((pid) => [pid, { stat: stat(pid, "sleep", "S", 1, pid, -1, 0), cmdline: "sleep\0" }])));
-    // Each pid's stat read is an `r`, each turn of the loop a `|`.
-    const events: string[] = [];
-    const actual = vi.mocked(readFileSync).getMockImplementation()!;
-    vi.mocked(readFileSync).mockImplementation(((file: string, options: never) => {
-      if (/\/\d+\/stat$/.test(file)) events.push("r");
-      return actual(file, options);
-    }) as typeof readFileSync);
-    let reading = true;
-    const turn = () => { events.push("|"); if (reading) setImmediate(turn); };
-    setImmediate(turn);
-    const pending = readProcTable(root);
-    // Nothing is read before the loop has turned.
-    expect(events).toEqual([]);
-    const rows = await pending.finally(() => { reading = false; vi.mocked(readFileSync).mockImplementation(actual); });
-    expect(rows).toHaveLength(120);
-    expect(events.join("").split("|").filter(Boolean).map((slice) => slice.length)).toEqual([50, 50, 20]);
+  it("reads off the event loop: a command line that waits holds no timer, and its row comes once it is read", async () => {
+    const root = fakeProc(0, {
+      7: { stat: stat(7, "sleep", "S", 1, 7, -1, 0), cmdline: "sleep\0" },
+      8: { stat: stat(8, "node", "S", 1, 8, -1, 0), cmdline: "" },
+    });
+    // A FIFO's read waits until it is written, as a cmdline's waits on its process's memory lock.
+    fs.rmSync(path.join(root, "8", "cmdline"));
+    execFileSync("mkfifo", [path.join(root, "8", "cmdline")]);
+    let settled = false;
+    const pending = readProcTable(root).finally(() => { settled = true; });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(settled).toBe(false);
+    const fifo = await fs.promises.open(path.join(root, "8", "cmdline"), "w");
+    await fifo.write("node\0server.js\0");
+    await fifo.close();
+    expect((await pending).map((row) => row.command).sort()).toEqual(["node server.js", "sleep"]);
   });
 
   it("keeps a process whose command line cannot be read by its name in brackets, and drops one that is gone", async () => {
