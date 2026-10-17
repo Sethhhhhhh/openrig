@@ -3849,20 +3849,40 @@ export class QueueRepository {
     const row = this.db.prepare("SELECT * FROM queue_items WHERE qitem_id = ?")
       .get(qitemId) as QueueItemRow | undefined;
     if (!row) return null;
-    // The delivery episode uses row fields, not the waiting/backstop view.
-    return this.deliveryOutcomesFor([row], owners && new Map([[qitemId, owners]])).get(qitemId) ?? null;
+    // The delivery episode uses row fields, not the waiting/backstop view. Its receipts are read after it, as they
+    // always were for a single row: a receipt committed while the human registry loads is then seen.
+    return this.deliveryOutcomesFor([row], owners && new Map([[qitemId, owners]]), true).get(qitemId) ?? null;
   }
 
   private receiptNotesStatement?: Database.Statement;
 
   /** The delivery ledger of each row, its reads batched: one read of the rows' owner notifications (unless the caller
    *  read them already), one of their receipts, the human registry loaded once at most. A single row's
-   *  (deliveryOutcomeFor, show, the sweeps) is a batch of one. */
-  private deliveryOutcomesFor(rows: LedgerRow[], knownOwners?: Map<string, QueueTransition[]>): Map<string, DeliveryLedger> {
+   *  (deliveryOutcomeFor, show, the sweeps) is a batch of one. receiptsAfterEpisodes: read the receipts once the
+   *  episodes (and so the registry) are worked out, as a single row's ledger does; a listing reads them before. */
+  private deliveryOutcomesFor(rows: LedgerRow[], knownOwners?: Map<string, QueueTransition[]>, receiptsAfterEpisodes = false): Map<string, DeliveryLedger> {
     const ledgers = new Map<string, DeliveryLedger>();
     if (!this.hasQueueTransitionsTable || rows.length === 0) return ledgers;
     const qitemIds = rows.map((row) => row.qitem_id);
     const owners = knownOwners ?? this.transitionLog.ownerNotificationsForQitems(qitemIds);
+    let notes = receiptsAfterEpisodes ? undefined : this.receiptNotesFor(qitemIds);
+    let registry: LoadResult | undefined;
+    const loadRegistry = () => (registry ??= this.loadHumanRegistryFn());
+    const episodes = rows.map((row) => {
+      const item = ledgerItem(row);
+      return { item, episode: this.currentDeliveryEpisode(item, owners.get(row.qitem_id) ?? [], loadRegistry) };
+    });
+    notes ??= this.receiptNotesFor(qitemIds);
+    for (const { item, episode } of episodes) {
+      if (episode === "inactive") continue;
+      const ledger = this.ledgerOf(item, episode, notes.get(item.qitemId) ?? []);
+      if (ledger) ledgers.set(item.qitemId, ledger);
+    }
+    return ledgers;
+  }
+
+  /** The delivery receipt notes of these qitems, newest first, by qitem. */
+  private receiptNotesFor(qitemIds: string[]): Map<string, string[]> {
     this.receiptNotesStatement ??= this.db.prepare(
       `SELECT qitem_id, transition_note FROM queue_transitions
         WHERE qitem_id IN (SELECT value FROM json_each(?)) AND (transition_note LIKE 'slack-owner-notification-posted %'
@@ -3875,16 +3895,7 @@ export class QueueRepository {
       if (own) own.push(row.transition_note);
       else notes.set(row.qitem_id, [row.transition_note]);
     }
-    let registry: LoadResult | undefined;
-    const loadRegistry = () => (registry ??= this.loadHumanRegistryFn());
-    for (const row of rows) {
-      const item = ledgerItem(row);
-      const episode = this.currentDeliveryEpisode(item, owners.get(row.qitem_id) ?? [], loadRegistry);
-      if (episode === "inactive") continue;
-      const ledger = this.ledgerOf(item, episode, notes.get(row.qitem_id) ?? []);
-      if (ledger) ledgers.set(row.qitem_id, ledger);
-    }
-    return ledgers;
+    return notes;
   }
 
   /** The ledger of one row's current episode, from its receipt notes (newest first). */

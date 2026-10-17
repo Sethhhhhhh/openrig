@@ -161,6 +161,45 @@ describe("queue list: delivery ledgers", () => {
     expect(owners[0]).toEqual(repo.transitionLog.latestOwnerNotificationForQitem(id));
   });
 
+  describe("a single row, with a receipt committed while the human registry loads", () => {
+    /** A pending ask to the human, past its post window, with no receipt yet: the next registry load commits its
+     *  posted receipt, as a second connection could while the ledger works out its episode. */
+    async function askPostedDuringRegistryLoad(): Promise<string> {
+      const id = await create("human-founder@external", { humanIntent: "decision" });
+      db.prepare("UPDATE queue_transitions SET ts = datetime('now', '-1 hour') WHERE qitem_id = ?").run(id);
+      db.prepare("UPDATE queue_items SET ts_created = datetime('now', '-1 hour') WHERE qitem_id = ?").run(id);
+      const key = latestKey(id);
+      loadRegistry.mockImplementationOnce(() => {
+        db.prepare("INSERT INTO queue_transitions (qitem_id, ts, state, transition_note, actor_session) VALUES (?, ?, 'pending', ?, 'daemon@kernel')")
+          .run(id, new Date().toISOString(), `slack-owner-notification-posted notification_key=${key} level=ALERT message_ts=1.2`);
+        return { ok: true as const, entities: [FOUNDER] };
+      });
+      return id;
+    }
+
+    it("reads the receipt in its ledger", async () => {
+      const id = await askPostedDuringRegistryLoad();
+      expect(repo.deliveryOutcomeFor(id)?.outcome).toBe("posted");
+    });
+
+    it("finds its ask posted to its human", async () => {
+      expect(repo.humanNotificationPostedThisEpisode(await askPostedDuringRegistryLoad())).toBe(true);
+    });
+
+    it("names no unclaimed sweep in its waiting view, alone or shown", async () => {
+      const awaiting = "none (posted to the human; awaiting their decision)";
+      expect(repo.waitingView(await askPostedDuringRegistryLoad())?.nextBackstop?.mechanism).toBe(awaiting);
+      const shown = repo.getById(await askPostedDuringRegistryLoad());
+      expect(shown?.waiting?.nextBackstop?.mechanism).toBe(awaiting);
+      expect(shown?.deliveryOutcome).toBe("posted");
+    });
+
+    it("is not listed undelivered", async () => {
+      const id = await askPostedDuringRegistryLoad();
+      expect(repo.findUndelivered({ compact: true }).map((item) => item.qitemId)).not.toContain(id);
+    });
+  });
+
   it("tells a full row's waiting view its ask was posted to its human, as the row alone does", async () => {
     await seed();
     const listed = repo.list({ limit: 1000 }).filter((item) => item.state === "pending");
