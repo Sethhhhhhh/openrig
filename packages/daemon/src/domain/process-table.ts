@@ -53,7 +53,9 @@ async function readPsTable(): Promise<ProcessTableRow[]> {
   });
 }
 
-// USER_HZ, the unit of /proc's start times: 100 on every architecture Node runs on.
+// USER_HZ (`getconf CLK_TCK`), the unit of /proc's start times. The kernel fixes it at 100 for user space on every
+// architecture Node supports (x64, arm, arm64, ppc64, s390x, riscv64, loong64), whatever its own tick rate; only
+// Alpha and IA-64 used another. A constant spares a sysconf call Node does not expose.
 const TICKS_PER_SECOND = 100;
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -97,6 +99,7 @@ function readProcRow(root: string, pid: string, bootTime: number): ProcessTableR
   let stat: string;
   let cmdline: string;
   try {
+    // utf8: Node reads it in one native call, where another encoding or a Buffer costs about twice as much.
     stat = readFileSync(`${root}/${pid}/stat`, "utf8");
     cmdline = readFileSync(`${root}/${pid}/cmdline`, "utf8");
   } catch {
@@ -107,7 +110,11 @@ function readProcRow(root: string, pid: string, bootTime: number): ProcessTableR
   const close = stat.lastIndexOf(")");
   const fields = stat.slice(close + 2).split(" ");
   if (close < 0 || fields.length < 20) return null;
-  const name = printable(stat.slice(stat.indexOf("(") + 1, close));
+  const comm = stat.slice(stat.indexOf("(") + 1, close);
+  const name = printable(comm);
+  // ucomm is cut on bytes, as the kernel cuts it: a name holding bytes that are no UTF-8 (rare) is read again as bytes,
+  // since its decoded text no longer counts them.
+  const nameBytes = comm.includes("�") ? commBytes(root, pid) ?? Buffer.from(comm) : Buffer.from(comm);
   // A kernel thread or a zombie has no command line: ps shows its name in brackets.
   const command = printable(cmdline.replace(/[\0\n]/g, " ")).trim()
     || `[${name}]${fields[0] === "Z" ? " <defunct>" : ""}`;
@@ -117,8 +124,18 @@ function readProcRow(root: string, pid: string, bootTime: number): ProcessTableR
     pgid: Number(fields[2]),
     tpgid: Number(fields[5]),
     // The kernel may give a worker thread a longer name; ucomm is the task name's 15 bytes.
-    executableName: Buffer.from(name).subarray(0, 15).toString(),
+    executableName: printable(nameBytes.subarray(0, 15).toString("utf8")),
     startedAt: lstart(bootTime + Math.floor(Number(fields[19]) / TICKS_PER_SECOND)),
     command,
   };
+}
+
+/** The raw bytes of a task's name, from its stat; null once it has exited. */
+function commBytes(root: string, pid: string): Buffer | null {
+  try {
+    const stat = readFileSync(`${root}/${pid}/stat`);
+    return stat.subarray(stat.indexOf("(") + 1, stat.lastIndexOf(")"));
+  } catch {
+    return null;
+  }
 }

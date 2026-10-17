@@ -20,7 +20,7 @@ afterEach(() => {
 });
 
 /** A /proc of its own: `btime`, then each pid's stat line and cmdline bytes. */
-function fakeProc(btime: number, processes: Record<number, { stat: string; cmdline: string }>): string {
+function fakeProc(btime: number, processes: Record<number, { stat: string | Buffer; cmdline: string }>): string {
   scratch = fs.mkdtempSync(path.join(os.tmpdir(), "process-table-"));
   fs.writeFileSync(path.join(scratch, "stat"), `cpu  1 2 3\nintr 0\nbtime ${btime}\nprocesses 9\n`);
   fs.mkdirSync(path.join(scratch, "self"));
@@ -54,6 +54,17 @@ describe("readProcTable", () => {
       { pid: 41, ppid: 40, pgid: 41, tpgid: 41, executableName: "claude", startedAt: "Tue Oct  6 10:00:00 2026", command: "claude --resume tok-1 a.b x y é" },
       { pid: 42, ppid: 40, pgid: 41, tpgid: 41, executableName: "sh", startedAt: "Tue Oct  6 10:00:00 2026", command: "[sh] <defunct>" },
     ]);
+  });
+
+  it("cuts a long name at 15 bytes, as the kernel cuts it, whatever bytes it holds", async () => {
+    // A worker's name with a byte that is no UTF-8 at the 4th place, then a two-byte é across the 15th byte.
+    const comm = Buffer.concat([Buffer.from("abc"), Buffer.from([0xff]), Buffer.from("defghijklméxyz")]);
+    const root = fakeProc(0, {
+      7: { stat: Buffer.concat([Buffer.from("7 ("), comm, Buffer.from(stat(7, "", "S", 2, 0, -1, 0).slice("7 (".length))]), cmdline: "" },
+    });
+    const [row] = await readProcTable(root);
+    expect(row!.executableName).toBe("abc�defghijklm�");
+    expect(row!.command).toBe("[abc�defghijklméxyz]");
   });
 
   it("hands the event loop back while it lists, then every 50 pids, so a large table never blocks it whole", async () => {
