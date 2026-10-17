@@ -160,6 +160,12 @@ export function rememberSelfHostId(baseUrl: string, selfHostId: string): void {
   knownSelfHostIds.set(baseUrl.replace(/\/+$/, ""), selfHostId);
 }
 
+/** Drops what an endpoint answered before, once a later probe of it fails or answers no id: the endpoint may lead to
+ *  another daemon since, and its clients prove their locality again. */
+export function forgetSelfHostId(baseUrl: string): void {
+  knownSelfHostIds.delete(baseUrl.replace(/\/+$/, ""));
+}
+
 export class DaemonClient {
   readonly baseUrl: string;
   private fetchImpl: typeof fetch = fetch;

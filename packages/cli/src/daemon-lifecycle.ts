@@ -1,7 +1,7 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
-import { connectionErrorCode, formatDaemonHostForUrl, rememberSelfHostId } from "./client.js";
+import { connectionErrorCode, forgetSelfHostId, formatDaemonHostForUrl, rememberSelfHostId } from "./client.js";
 import { blockedConnectionGuidance, isBlockedConnectionCode } from "./daemon-reachability.js";
 import type { DaemonStartLock } from "./daemon-start-lock.js";
 import { DAEMON_STOP_WAIT_MS, DAEMON_SHUTDOWN_RECEIPT, type DaemonShutdownReceipt } from "@openrig/daemon/daemon-shutdown";
@@ -991,10 +991,13 @@ export async function getDaemonStatus(
     try {
       const res = await probeHealthzWithSettle(deps, `${openrigUrl}/healthz`);
       const ev = await readHealthEvidence(res);
+      // Only this answer speaks for the endpoint now: an earlier id may be another daemon's.
       if (ev.selfHostId) rememberSelfHostId(openrigUrl, ev.selfHostId);
+      else forgetSelfHostId(openrigUrl);
       const url = new URL(openrigUrl);
       return { state: "running", port: Number(url.port) || DEFAULT_PORT, host: url.hostname || DEFAULT_HOST, healthy: ev.healthy, reason: ev.reason, eventLoop: ev.eventLoop };
     } catch (err) {
+      forgetSelfHostId(openrigUrl);
       // 1ae863d2: refusal = positive down; anything else (timeout/wedged/blocked) = unverified.
       return isRefusedError(err) ? { state: "stopped" } : { state: "unverified", ...probeErrorCodeOf(err) };
     }

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonClient, rememberSelfHostId, SENDER_IDENTITY_HEADER } from "../src/client.js";
+import { getDaemonStatus, type LifecycleDeps } from "../src/daemon-lifecycle.js";
 
 vi.mock("../src/local-origin.js", () => ({ readLocalOrigin: () => "host-local" }));
 
@@ -19,6 +20,26 @@ function recordingFetch(selfHostId: string): { fetchImpl: typeof fetch; urls: st
   }) as typeof fetch;
   return { fetchImpl, urls, sessions };
 }
+
+/** The deps of a status probe on `OPENRIG_URL`: only its /healthz answer matters. */
+function statusDeps(fetch: LifecycleDeps["fetch"]): LifecycleDeps {
+  const unused = (): never => { throw new Error("not used by a status probe"); };
+  return {
+    fetch,
+    sleep: async () => {},
+    spawn: unused,
+    kill: unused,
+    readFile: () => null,
+    writeFile: unused,
+    removeFile: unused,
+    exists: () => false,
+    mkdirp: unused,
+    openForAppend: unused,
+    isProcessAlive: () => false,
+  };
+}
+
+const answering = (body: unknown): LifecycleDeps["fetch"] => async () => ({ ok: true, json: async () => body });
 
 describe("a seat's locality proof on a direct endpoint", () => {
   beforeEach(() => {
@@ -55,5 +76,27 @@ describe("a seat's locality proof on a direct endpoint", () => {
     await new DaemonClient(url, { fetchImpl: seen.fetchImpl }).get("/api/queue/list");
     expect(seen.urls).toEqual([`${url}/api/queue/list`]);
     expect(seen.sessions).toEqual(["qa@rig@host-local"]);
+  });
+
+  const laterProbes: Array<[string, LifecycleDeps["fetch"]]> = [
+    ["fails", async () => { throw new Error("connect ECONNREFUSED"); }],
+    ["answers an error", async () => ({ ok: false })],
+    ["answers without an id", answering({ status: "ok" })],
+  ];
+
+  it.each(laterProbes)("forgets the remembered id when a later status probe %s", async (_, laterFetch) => {
+    const url = endpoint();
+    vi.stubEnv("OPENRIG_URL", url);
+    await getDaemonStatus(statusDeps(answering({ selfHostId: "host-local" })));
+    const before = recordingFetch("host-forwarded");
+    await new DaemonClient(url, { fetchImpl: before.fetchImpl }).get("/api/queue/list");
+    expect(before.urls).toEqual([`${url}/api/queue/list`]);
+
+    // The endpoint now leads to another instance: its clients prove their locality again.
+    await getDaemonStatus(statusDeps(laterFetch));
+    const after = recordingFetch("host-forwarded");
+    await new DaemonClient(url, { fetchImpl: after.fetchImpl }).get("/api/queue/list");
+    expect(after.urls).toEqual([`${url}/healthz`, `${url}/api/queue/list`]);
+    expect(after.sessions).toEqual(["qa@rig@host-local"]);
   });
 });
