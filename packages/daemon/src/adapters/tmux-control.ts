@@ -1,5 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { spawnTmuxClient } from "./tmux-exec.js";
 import type { ArgvExecFn } from "./tmux.js";
 
 /**
@@ -225,8 +226,8 @@ function commandFailed(argv: string[], stdout: string, stderr: string): Error {
   });
 }
 
-/** Spawns the control client with these tmux arguments; tests give their own. */
-export type SpawnControlClient = (args: string[]) => ChildProcessWithoutNullStreams;
+/** Starts the control client with these tmux arguments (`spawnTmuxClient`); tests give their own. */
+export type SpawnControlClient = (args: string[]) => ChildProcessWithoutNullStreams | Promise<ChildProcessWithoutNullStreams>;
 
 export interface TmuxControlOptions {
   spawnClient?: SpawnControlClient;
@@ -267,9 +268,7 @@ export type TmuxControlExec = ArgvExecFn & { close: () => Promise<void>; owner: 
  */
 export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOptions = {}): TmuxControlExec {
   const owner = options.owner ?? randomBytes(4).toString("hex");
-  const spawnClient = options.spawnClient ?? ((args: string[]) => spawn("tmux", args, {
-    stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
-  }));
+  const spawnClient = options.spawnClient ?? spawnTmuxClient;
   const replyTimeoutMs = options.replyTimeoutMs ?? 10_000;
   const now = options.now ?? (() => Date.now());
   let client: ControlClient | null = null;
@@ -369,7 +368,13 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       return null;
     }
     if (closed) return null;
-    const child = spawnClient(clientArgs());
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = await spawnClient(clientArgs());
+    } catch {
+      backOff(); // tmux could not be started at all: asked again later, not at every command.
+      return null;
+    }
     const replies = new ControlReplies();
     const started: ControlClient = { child, replies, headSince: 0, users: 0, retiring: false };
     live.add(started);
@@ -381,7 +386,10 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => replies.push(chunk));
     child.stderr.resume();
-    child.on("error", (err) => drop(started, err.message));
+    child.on("error", (err) => {
+      if (child.pid === undefined) live.delete(started); // never started: no exit will follow
+      drop(started, err.message);
+    });
     child.on("exit", (code, signal) => {
       live.delete(started);
       drop(started, `exited (${signal ?? code})`);
@@ -400,6 +408,9 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       replies.onAttached = settle;
       cancelAttach = () => settle(false);
       child.once("exit", () => settle(false));
+      // A spawn error may come without an exit: nothing runs, so nothing will attach.
+      child.once("error", () => settle(false));
+      if (closed) settle(false);
     });
     attachedOnce ||= attached;
     client = started;

@@ -315,6 +315,34 @@ describe("tmuxControlExec", () => {
     expect(client.written).toEqual([]);
   });
 
+  it("settles its attach at once on a spawn error, spawns the call, and starts no client again for a while", async () => {
+    const client = fakeClient({ attach: false });
+    const { spawned, fallback } = fakeSpawned(() => "spawned\n");
+    let started = 0;
+    const exec = tmuxControlExec(fallback, { spawnClient: () => { started++; return client.child; }, replyTimeoutMs: 60_000 });
+    setImmediate(() => client.child.emit("error", Object.assign(new Error("spawn tmux ENOENT"), { code: "ENOENT", syscall: "spawn tmux" })));
+    const begun = Date.now();
+    expect(await exec(["tmux", "has-session", "-t", "=s"])).toBe("spawned\n");
+    expect(Date.now() - begun).toBeLessThan(1_000);
+    expect(await exec(["tmux", "has-session", "-t", "=s"])).toBe("spawned\n");
+    expect(started).toBe(1);
+    expect(spawned).toHaveLength(2);
+    await exec.close();
+  });
+
+  it("spawns the call when its client cannot be started at all, and backs off", async () => {
+    const { spawned, fallback } = fakeSpawned(() => "spawned\n");
+    let started = 0;
+    const exec = tmuxControlExec(fallback, {
+      spawnClient: async () => { started++; throw Object.assign(new Error("spawn /bin/sh ENOENT"), { syscall: "spawn /bin/sh" }); },
+    });
+    expect(await exec(["tmux", "has-session", "-t", "=s"])).toBe("spawned\n");
+    expect(await exec(["tmux", "has-session", "-t", "=s"])).toBe("spawned\n");
+    expect(started).toBe(1);
+    expect(spawned).toHaveLength(2);
+    await exec.close();
+  });
+
   it("retires its client once only control sessions are left, after the call running on it, and starts one again while sessions remain", async () => {
     const clients = [fakeClient({ checks: [[""]] }), fakeClient()];
     let started = 0;
