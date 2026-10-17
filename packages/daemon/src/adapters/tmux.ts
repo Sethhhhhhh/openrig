@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join as pathJoin } from "node:path";
 import { randomUUID } from "node:crypto";
 import { parentSessionEnvKeys } from "../domain/parent-session-env.js";
-import { IS_CONTROL_SESSION, type TmuxControlExec } from "./tmux-control.js";
+import type { TmuxControlExec } from "./tmux-control.js";
 
 export type ExecFn = (cmd: string) => Promise<string>;
 
@@ -126,10 +126,8 @@ export type SessionProbe =
   | { state: "transport_unavailable"; cause: string };
 
 const TMUX_FIELD_SEPARATOR = "|";
-// The daemon's control session (tmux-control.ts) reads with an empty name, which the parsers skip: whatever it is
-// named, on any tmux, whether or not this daemon drives tmux through it.
 const SESSION_FORMAT = [
-  `#{?${IS_CONTROL_SESSION},,#{session_name}}`,
+  "#{session_name}",
   "#{session_windows}",
   "#{session_created}",
   "#{session_attached}",
@@ -154,7 +152,7 @@ const PANE_FORMAT = [
 ].join(TMUX_FIELD_SEPARATOR);
 const CLIENT_FORMAT = [
   "#{client_name}",
-  `#{?${IS_CONTROL_SESSION},,#{client_session}}`,
+  "#{client_session}",
 ].join(TMUX_FIELD_SEPARATOR);
 const CURSOR_FORMAT = [
   "#{cursor_x}",
@@ -279,10 +277,9 @@ function parseSessionLine(line: string): TmuxSession | null {
   // Only the final three fields are metadata; a literal session name may
   // itself contain the printable separator, just like pane paths/window names.
   const windows = parseInt(parts.at(-3)!, 10);
-  const name = parts.slice(0, -3).join(TMUX_FIELD_SEPARATOR);
-  if (isNaN(windows) || name === "") return null;
+  if (isNaN(windows)) return null;
   return {
-    name,
+    name: parts.slice(0, -3).join(TMUX_FIELD_SEPARATOR),
     windows,
     created: parts.at(-2)!,
     attached: parts.at(-1) === "1",
@@ -475,7 +472,7 @@ export class TmuxAdapter {
     return this.exec(legacy ?? posixJoinArgv(argv));
   }
 
-  /** Ends the daemon's tmux control client and kills its session (tmux-control.ts), when tmux is driven through one. */
+  /** Ends the daemon's tmux control client, and with it its session (tmux-control.ts), when tmux is driven through one. */
   async closeControlClient(): Promise<void> {
     await (this.argvExec as Partial<TmuxControlExec> | undefined)?.close?.();
   }
@@ -1524,8 +1521,6 @@ export class TmuxAdapter {
     try {
       const output = await this.run(["tmux", "list-clients", "-F", CLIENT_FORMAT],
         `tmux list-clients -F "${CLIENT_FORMAT}"`);
-      // The daemon's own control client (tmux-control.ts) is no terminal a person sees: its session reads empty
-      // (CLIENT_FORMAT), so it is never one to switch.
       return parseLines(output, parseClientLine);
     } catch (err) {
       if (isNoServerError(err) || isTmuxTransportAbsentError(err)) return [];

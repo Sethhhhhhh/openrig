@@ -3,7 +3,6 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { CONTROL_SESSION } from "../src/adapters/tmux-control.js";
 import { prepareHermeticEnv, type HermeticScaffold } from "./helpers/hermetic-env.js";
 import { runRig, spawnScenarioDaemon, type ScenarioDaemon } from "./helpers/scenario-daemon.js";
 
@@ -54,11 +53,10 @@ describe("intentional seat stop CLI journey", () => {
     return seats.find((seat) => seat.canonicalSessionName === reviewer)!;
   }
 
-  // The seats' sessions: the daemon's own control session (tmux-control.ts) is no seat.
   function sessions(): string[] {
     return execFileSync("tmux", ["-S", scaffold!.tmuxSocketPath, "list-sessions", "-F", "#{session_name}"], {
       env: scaffold!.env, encoding: "utf8",
-    }).trim().split("\n").filter((name) => name !== CONTROL_SESSION).sort();
+    }).trim().split("\n").sort();
   }
 
   beforeAll(async () => {

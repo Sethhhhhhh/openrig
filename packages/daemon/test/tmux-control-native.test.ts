@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execArgvCommand } from "../src/adapters/tmux-exec.js";
-import { CONTROL_OPTION, CONTROL_SESSION, supportsControlMode, tmuxControlExec, withoutControlSession } from "../src/adapters/tmux-control.js";
+import { CONTROL_OPTION, controlSessionName, markOwnRows, supportsControlMode, tmuxControlExec, withoutOwnRows } from "../src/adapters/tmux-control.js";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { TmuxDiscoveryScanner } from "../src/domain/tmux-discovery-scanner.js";
 
@@ -30,6 +30,7 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
   /** What the control exec handed to a spawned client. */
   let spawned: string[][];
   const tmux = (...args: string[]) => execFileSync("tmux", args, { encoding: "utf8" });
+  const sessions = () => tmux("list-sessions", "-F", "#{session_name}").split("\n").filter(Boolean).sort();
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "openrig-control-"));
@@ -71,12 +72,15 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     ["tmux", "display-message", "-p", "-t", "=seat@rig:", "x", ";"],
   ];
 
-  it("gives every read the spawned client's stdout, error text and execStderr", async () => {
+  it("gives every read the spawned client's stdout, error text and execStderr, its own rows left out", async () => {
     await sleep(300);
     await control(["tmux", "has-session", "-t", "=seat@rig"]); // connects: the control session exists from here on
     const connecting = spawned.length;
     for (const argv of reads) {
-      const expected = await outcome(execArgvCommand, withoutControlSession(argv));
+      // The spawned client lists the control session too; the control exec leaves its rows out, and only those.
+      const marked = ["tmux", ...markOwnRows(argv.slice(1), control.owner)];
+      const expected = await outcome(execArgvCommand, marked) as { stdout?: string };
+      if (expected.stdout !== undefined) expected.stdout = withoutOwnRows(expected.stdout, control.owner);
       expect(await outcome(control, argv), argv.join(" ")).toEqual(expected);
     }
     // Every one of them went through the control client.
@@ -92,46 +96,62 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
       control(["tmux", "display-message", "-p", "-t", "=seat@rig:", "b1"]),
       control(["tmux", "display-message", "-p", "-t", "=seat@rig:", "b2"]),
     ]);
+    // A spawned client prints the hook's output after its command's; the control client keeps it out of every reply.
+    expect(tmux("list-panes", "-t", "=seat@rig:", "-F", "#{pane_id}")).toBe(`${pane}hook-output\nhook-output\n`);
     expect(replies).toEqual([pane, "b1\n", "b2\n"]);
     expect(await control(["tmux", "display-message", "-p", "-t", "=seat@rig:", "c1"])).toBe("c1\n");
   });
 
-  it("leaves its own session out of every listing, and the adapter its client out of the clients", async () => {
+  it("leaves its own session and client out of every listing, renamed or not; a spawned client lists them, as main does", async () => {
     await control(["tmux", "has-session", "-t", "=seat@rig"]);
-    expect(tmux("list-sessions", "-F", "#{session_name}")).toContain(CONTROL_SESSION);
-    expect(await control(["tmux", "list-sessions", "-F", "#{session_name}"])).toBe("seat@rig\n");
-    expect(await control(["tmux", "list-panes", "-a", "-F", "#{session_name}"])).toBe("seat@rig\n");
-    expect(tmux("list-clients", "-F", "#{client_session}")).toContain(CONTROL_SESSION);
-    expect(await new TmuxAdapter(async () => "", undefined, control).listClients()).toEqual([]);
-  });
-
-  it("knows its session by its mark, not its name: renamed, it stays out of listings, with or without the control client", async () => {
-    await control(["tmux", "has-session", "-t", "=seat@rig"]);
-    tmux("rename-session", "-t", `=${CONTROL_SESSION}`, "renamed");
-    expect(tmux("show-options", "-v", "-t", "=renamed:", CONTROL_OPTION).trim()).toBe("1");
+    const own = controlSessionName(control.owner);
+    expect(sessions()).toEqual([own, "seat@rig"]);
+    expect(tmux("show-options", "-v", "-t", `=${own}:`, CONTROL_OPTION).trim()).toBe(control.owner);
+    tmux("rename-session", "-t", `=${own}`, "renamed");
     expect(await control(["tmux", "list-sessions", "-F", "#{session_name}"])).toBe("seat@rig\n");
     expect(await control(["tmux", "list-windows", "-a", "-F", "#{session_name}"])).toBe("seat@rig\n");
-    for (const exec of [control, execArgvCommand]) {
-      const adapter = new TmuxAdapter(async () => "", undefined, exec);
-      expect((await adapter.listSessions()).map((s) => s.name)).toEqual(["seat@rig"]);
-      expect(await adapter.listClients()).toEqual([]);
-      expect((await new TmuxDiscoveryScanner({ tmuxAdapter: adapter }).scan()).panes.map((p) => p.tmuxSession)).toEqual(["seat@rig"]);
-    }
-    // The daemon's stop kills it by id, whatever its name, and leaves every other session.
+    expect(await control(["tmux", "list-panes", "-a", "-F", "#{session_name}"])).toBe("seat@rig\n");
+    const on = new TmuxAdapter(async () => "", undefined, control);
+    expect((await on.listSessions()).map((s) => s.name)).toEqual(["seat@rig"]);
+    expect(await on.listClients()).toEqual([]);
+    expect((await new TmuxDiscoveryScanner({ tmuxAdapter: on }).scan()).panes.map((p) => p.tmuxSession)).toEqual(["seat@rig"]);
+    const off = new TmuxAdapter(async () => "", undefined, execArgvCommand);
+    expect((await off.listSessions()).map((s) => s.name).sort()).toEqual(["renamed", "seat@rig"]);
+    expect((await off.listClients()).map((c) => c.session)).toEqual(["renamed"]);
+    // The daemon's stop ends its client, and tmux destroys its session with it, whatever its name.
     await control.close();
-    expect(tmux("list-sessions", "-F", "#{session_name}")).toBe("seat@rig\n");
+    await vi.waitFor(() => expect(sessions()).toEqual(["seat@rig"]), { timeout: 5000, interval: 50 });
   });
 
-  it("marks a control session an older daemon made, and kills it when it stops", async () => {
-    tmux("new-session", "-d", "-s", CONTROL_SESSION, "-x", "80", "-y", "24");
-    await control(["tmux", "has-session", "-t", "=seat@rig"]);
-    expect(tmux("show-options", "-v", "-t", `=${CONTROL_SESSION}:`, CONTROL_OPTION).trim()).toBe("1");
-    expect(await new TmuxAdapter(async () => "", undefined, execArgvCommand).listSessions()).toHaveLength(1);
-    await control.close();
-    expect(tmux("list-sessions", "-F", "#{session_name}")).toBe("seat@rig\n");
-    // Closed, it spawns what it is given and starts no client again.
+  it("never takes over a session it did not make: one with its name, another daemon's, or one named openrig-control", async () => {
+    const own = controlSessionName(control.owner);
+    tmux("new-session", "-d", "-s", own, "-x", "80", "-y", "24");
+    tmux("new-session", "-d", "-s", "openrig-control", "-x", "80", "-y", "24");
+    tmux("new-session", "-d", "-s", "other-daemon", "-x", "80", "-y", "24");
+    tmux("set-option", "-t", "=other-daemon:", CONTROL_OPTION, "ffff0000");
+    // Its own name is taken: no client attaches, nothing is marked, and every command is spawned.
     expect(await control(["tmux", "has-session", "-t", "=seat@rig"])).toBe("");
-    expect(tmux("list-sessions", "-F", "#{session_name}")).toBe("seat@rig\n");
+    expect(spawned.map((argv) => argv[1])).toEqual(["list-sessions", "has-session"]);
+    expect(tmux("show-options", "-qv", "-t", `=${own}:`, CONTROL_OPTION).trim()).toBe("");
+    const all = ["openrig-control", own, "other-daemon", "seat@rig"];
+    expect((await new TmuxAdapter(async () => "", undefined, control).listSessions()).map((s) => s.name).sort()).toEqual(all);
+    await control.close();
+    expect(sessions()).toEqual(all);
+  });
+
+  it("lists another daemon's control session and client, and leaves them on its stop", async () => {
+    const other = tmuxControlExec(execArgvCommand, { owner: "ffff0000" });
+    try {
+      await other(["tmux", "has-session", "-t", "=seat@rig"]);
+      await control(["tmux", "has-session", "-t", "=seat@rig"]);
+      expect(await control(["tmux", "list-sessions", "-F", "#{session_name}"])).toBe("openrig-control-ffff0000\nseat@rig\n");
+      expect((await new TmuxAdapter(async () => "", undefined, control).listClients()).map((c) => c.session))
+        .toEqual(["openrig-control-ffff0000"]);
+      await control.close();
+      await vi.waitFor(() => expect(sessions()).toEqual(["openrig-control-ffff0000", "seat@rig"]), { timeout: 5000, interval: 50 });
+    } finally {
+      await other.close();
+    }
   });
 
   it("runs its keep-alive without a shell of the user's: what default-shell names is never started", async () => {
@@ -139,7 +159,9 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     writeFileSync(shell, `#!/bin/sh\ntouch ${join(dir, "shell-ran")}\nexec sh "$@"\n`, { mode: 0o755 });
     tmux("set-option", "-g", "default-shell", shell);
     await control(["tmux", "has-session", "-t", "=seat@rig"]);
-    expect(tmux("display-message", "-p", "-t", `=${CONTROL_SESSION}:`, "#{pane_current_command}").trim()).toBe("sh");
+    // The pane reads as the server (tmux) until its fork has exec'd sh.
+    await vi.waitFor(() => expect(tmux("display-message", "-p", "-t", `=${controlSessionName(control.owner)}:`, "#{pane_current_command}").trim()).toBe("sh"),
+      { timeout: 5000, interval: 50 });
     expect(existsSync(join(dir, "shell-ran"))).toBe(false);
   });
 
@@ -165,15 +187,15 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     await lines(4);
   });
 
-  it("keeps working when its client or its session is killed, and comes back", async () => {
+  it("keeps working when its session is killed, and comes back", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     await control(["tmux", "has-session", "-t", "=seat@rig"]);
-    tmux("kill-session", "-t", `=${CONTROL_SESSION}`);
+    tmux("kill-session", "-t", `=${controlSessionName(control.owner)}`);
     await vi.waitFor(async () => expect(await control(["tmux", "has-session", "-t", "=seat@rig"])).toBe(""));
     expect(await control(["tmux", "list-sessions", "-F", "#{session_name}"])).toBe("seat@rig\n");
     vi.setSystemTime(Date.now() + 60_000);
     await control(["tmux", "has-session", "-t", "=seat@rig"]);
-    expect(tmux("list-sessions", "-F", "#{session_name}")).toContain(CONTROL_SESSION);
+    expect(sessions()).toContain(controlSessionName(control.owner));
     vi.useRealTimers();
   });
 
@@ -188,7 +210,7 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     const connecting = spawned.length;
     expect(await control(["tmux", "list-sessions", "-F", "#{session_name}"])).toBe("next@rig\n");
     expect(spawned.slice(connecting)).toEqual([]);
-    expect(tmux("show-options", "-v", "-t", `=${CONTROL_SESSION}:`, CONTROL_OPTION).trim()).toBe("1");
+    expect(tmux("show-options", "-v", "-t", `=${controlSessionName(control.owner)}:`, CONTROL_OPTION).trim()).toBe(control.owner);
     vi.useRealTimers();
   });
 
@@ -210,7 +232,7 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     const exec = tmuxControlExec(async (argv) => { spawned.push(argv); return execArgvCommand(argv); });
     await expect(exec(["tmux", "has-session", "-t", "=seat@rig"])).rejects.toThrow(/no server running|error connecting/);
     expect(() => tmux("list-sessions")).toThrow();
-    expect(spawned.map((a) => a[1])).toEqual(["-V", "set-option", "has-session"]);
-    exec.close();
+    expect(spawned.map((a) => a[1])).toEqual(["list-sessions", "has-session"]);
+    await exec.close();
   });
 });

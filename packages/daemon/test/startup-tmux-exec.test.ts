@@ -34,30 +34,39 @@ describe("createDaemon tmux exec wiring", { timeout: 120000 }, () => {
   });
 
   for (const host of ["linux", "darwin"] as const) {
-    it(`runs tmux without a shell, through its control client, on ${host}`, async () => {
+    it(`runs tmux without a shell on ${host}, a client spawned per command unless control mode is asked for`, async () => {
+      Object.defineProperty(process, "platform", { ...platform, value: host });
+      for (const value of [undefined, "0", "true"]) {
+        vi.stubEnv("OPENRIG_TMUX_CONTROL", value);
+        const daemon = await createDaemon({ dbPath: ":memory:", cmuxFactory });
+        try {
+          expect(argvExecOf(daemon.deps.tmuxAdapter), String(value)).toBe(execArgvCommand);
+        } finally {
+          daemon.eventLoopMonitor.stop();
+          daemon.db.close();
+        }
+      }
+    });
+  }
+
+  it("OPENRIG_TMUX_CONTROL=1 drives tmux through its control client on linux and darwin, never on Windows", async () => {
+    vi.stubEnv("OPENRIG_TMUX_CONTROL", "1");
+    for (const host of ["linux", "darwin", "win32"] as const) {
       Object.defineProperty(process, "platform", { ...platform, value: host });
       const daemon = await createDaemon({ dbPath: ":memory:", cmuxFactory });
       try {
         const exec = argvExecOf(daemon.deps.tmuxAdapter) as (ArgvExecFn & { close?: () => Promise<void> }) | undefined;
-        expect(exec).not.toBe(execArgvCommand);
-        expect(typeof exec?.close).toBe("function");
+        if (host === "win32") {
+          expect(exec, host).toBe(execArgvCommand);
+        } else {
+          expect(exec, host).not.toBe(execArgvCommand);
+          expect(typeof exec?.close, host).toBe("function");
+        }
         await daemon.deps.tmuxAdapter.closeControlClient();
       } finally {
         daemon.eventLoopMonitor.stop();
         daemon.db.close();
       }
-    });
-  }
-
-  it("OPENRIG_TMUX_CONTROL=0 spawns a tmux client per command, without a shell", async () => {
-    vi.stubEnv("OPENRIG_TMUX_CONTROL", "0");
-    Object.defineProperty(process, "platform", { ...platform, value: "linux" });
-    const daemon = await createDaemon({ dbPath: ":memory:", cmuxFactory });
-    try {
-      expect(argvExecOf(daemon.deps.tmuxAdapter)).toBe(execArgvCommand);
-    } finally {
-      daemon.eventLoopMonitor.stop();
-      daemon.db.close();
     }
   });
 

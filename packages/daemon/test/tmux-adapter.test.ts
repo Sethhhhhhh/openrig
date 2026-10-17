@@ -45,14 +45,8 @@ describe("TmuxAdapter", () => {
 
       expect(exec).toHaveBeenCalledOnce();
       expect(exec.mock.calls[0]![0]).toBe(
-        'tmux list-sessions -F "#{?#{==:#{@openrig-control},1},,#{session_name}}|#{session_windows}|#{session_created}|#{session_attached}"'
+        'tmux list-sessions -F "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}"'
       );
-    });
-
-    it("skips the daemon's control session, which reads with an empty name", async () => {
-      const output = ["|1|2026-03-23T01:00:00|1", "my-session|1|2026-03-23T01:00:00|0"].join("\n");
-      const adapter = new TmuxAdapter(mockExec({ "list-sessions": { stdout: output } }));
-      expect((await adapter.listSessions()).map((s) => s.name)).toEqual(["my-session"]);
     });
 
     it("parses output into typed TmuxSession objects", async () => {
@@ -1136,7 +1130,7 @@ describe("TmuxAdapter", () => {
 
       expect(exec).toHaveBeenCalledOnce();
       expect(exec.mock.calls[0]![0]).toBe(
-        'tmux list-clients -F "#{client_name}|#{?#{==:#{@openrig-control},1},,#{client_session}}"'
+        'tmux list-clients -F "#{client_name}|#{client_session}"'
       );
     });
 
