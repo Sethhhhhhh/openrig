@@ -323,8 +323,6 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
   let starting: Promise<ControlClient | null> | null = null;
   let failures = 0;
   let retryAt = 0;
-  /** Set once a client of this daemon attached: from then on its session may exist, and listings mark its rows. */
-  let attachedOnce = false;
   let closed = false;
   /** Every client of this daemon still running: the current one, one attaching, and those retiring. */
   const live = new Set<ControlClient>();
@@ -462,7 +460,6 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       child.once("error", () => settle(false));
       if (closed) settle(false);
     });
-    attachedOnce ||= attached;
     client = started;
     if (!attached || closed) {
       drop(started, closed ? "closed" : "did not attach");
@@ -530,8 +527,10 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     const routable = bin === "tmux" && argsIn.length > 0 && !argsIn[0]!.startsWith("-") && commandsIn.length > 0
       && commandsIn.every((c) => ROUTED.has(c[0]!) && namesItsTarget(c))
       && argsIn.every((a) => !/[\n\r\0]/.test(a));
-    // Once a client of this daemon attached, its session may be on the server: listings leave its rows out.
-    const marked = attachedOnce && bin === "tmux" && commandsIn.some((c) => LISTINGS.has(c[0]!));
+    // Every listing leaves this daemon's own rows out, from the first one on: its session may be made by the very call
+    // that lists, or by another one under way. A row is marked only on this daemon's own mark, so before its session
+    // exists the output is unchanged.
+    const marked = bin === "tmux" && commandsIn.some((c) => LISTINGS.has(c[0]!));
     const argv = marked ? [bin, ...markOwnRows(argsIn, owner)] : argvIn;
     const own = (text: string): string => marked ? withoutOwnRows(text, owner) : text;
     const target = routable ? await connected() : null;

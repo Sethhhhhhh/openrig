@@ -123,6 +123,26 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     await vi.waitFor(() => expect(sessions()).toEqual(["seat@rig"]), { timeout: 5000, interval: 50 });
   });
 
+  it("leaves its own session and client out of the very listing that starts its client", async () => {
+    const listings = [
+      ["tmux", "list-sessions", "-F", "#{session_name}"],
+      ["tmux", "list-windows", "-a", "-F", "#{session_name}"],
+      ["tmux", "list-panes", "-a", "-F", "#{session_name}"],
+      ["tmux", "list-clients", "-F", "#{client_session}"],
+    ];
+    for (const argv of listings) {
+      const first = tmuxControlExec(execArgvCommand);
+      try {
+        const expected = argv[1] === "list-clients" ? "" : "seat@rig\n";
+        expect(await first(argv), argv.join(" ")).toBe(expected);
+        expect(sessions()).toContain(controlSessionName(first.owner));
+      } finally {
+        await first.close();
+      }
+      await vi.waitFor(() => expect(sessions()).toEqual(["seat@rig"]), { timeout: 5000, interval: 50 });
+    }
+  });
+
   it("never takes over a session it did not make: one with its name, another daemon's, or one named openrig-control", async () => {
     const own = controlSessionName(control.owner);
     tmux("new-session", "-d", "-s", own, "-x", "80", "-y", "24");

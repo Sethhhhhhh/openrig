@@ -451,19 +451,19 @@ describe("tmuxControlExec", () => {
     await exec.close();
   });
 
-  it("leaves out of a listing only the rows of its own session and client, once it has one", async () => {
+  it("leaves out of a listing only the rows of its own session and client, from the first listing on", async () => {
     const client = fakeClient();
-    const { fallback } = fakeSpawned((argv) => argv[1] === "list-sessions" ? "seat@rig\nopenrig-control-other\n" : "");
+    const { spawned, fallback } = fakeSpawned((argv) => argv[1] === "list-sessions" ? "seat@rig\nopenrig-control-other\n" : "");
     const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, owner: "d4e5", replyTimeoutMs: 1000 });
-    const read = exec(["tmux", "has-session", "-t", "=seat@rig"]);
-    await vi.waitFor(() => expect(client.written).toHaveLength(1));
-    client.answer();
-    await read;
+    // The first call is a listing, and its client is made for it: the session it makes is left out already.
     const listing = exec(["tmux", "list-sessions", "-F", "#{session_name}"]);
-    await vi.waitFor(() => expect(client.written).toHaveLength(2));
-    expect(client.written[1]).toBe("'list-sessions' '-F' '#{?#{==:#{@openrig-control},d4e5},openrig-control-d4e5:,}#{session_name}'");
+    await vi.waitFor(() => expect(client.written).toHaveLength(1));
+    expect(client.written[0]).toBe("'list-sessions' '-F' '#{?#{==:#{@openrig-control},d4e5},openrig-control-d4e5:,}#{session_name}'");
     client.answer("openrig-control-d4e5:openrig-control-d4e5", "seat@rig", "openrig-control", "openrig-control-other");
     expect(await listing).toBe("seat@rig\nopenrig-control\nopenrig-control-other\n");
+    // A listing spawned (no -a: it would read the control client's own session) is marked as well.
+    expect(await exec(["tmux", "list-windows", "-F", "#{window_index}"])).toBe("");
+    expect(spawned).toEqual([["tmux", "list-windows", "-F", "#{?#{==:#{@openrig-control},d4e5},openrig-control-d4e5:,}#{window_index}"]]);
     await exec.close();
   });
 });
