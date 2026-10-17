@@ -262,6 +262,27 @@ describe("SSE events route", () => {
       expect(ids(await readSSEEvents(res, 3))).toEqual(seqs.slice(1));
     });
 
+    it("a count beyond SQLite's integers replays the whole log", async () => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 3);
+      for (const count of ["100000000000000000000", "9".repeat(400)]) {
+        const res = await app.request(`/api/events?rigId=${rig.id}&replay=${count}`);
+        expect(ids(await readSSEEvents(res, 3)), count).toEqual(seqs);
+      }
+    });
+
+    it("a replay that fails to start releases its subscription", async () => {
+      const rig = rigRepo.createRig("r01");
+      emitMany(rig.id, 3);
+      const countBefore = eventBus.subscriberCount;
+      vi.spyOn(eventBus, "seqBeforeNewest").mockImplementation(() => {
+        throw new Error("lookup failed");
+      });
+      const res = await app.request(`/api/events?rigId=${rig.id}&replay=2`);
+      await readSSEEvents(res, 1, 200);
+      await vi.waitFor(() => expect(eventBus.subscriberCount).toBe(countBefore), { timeout: 1000 });
+    });
+
     it("refuses a replay that is neither a number nor all", async () => {
       for (const value of ["-1", "some", "1.5", ""]) {
         const res = await app.request(`/api/events?replay=${value}`);

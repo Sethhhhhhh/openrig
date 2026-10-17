@@ -222,9 +222,11 @@ export class EventBus {
   }
 
   /** The seq after which the newest `count` events start (of one rig when `rigId` is given): 0 when there are no more
-   *  than `count`, the newest seq for 0. */
+   *  than `count`, the newest seq for 0. A count past a safe integer is more than any log holds: never an OFFSET SQLite
+   *  cannot take. */
   seqBeforeNewest(count: number, rigId?: string): number {
     if (count === 0) return this.maxSeq();
+    if (!Number.isSafeInteger(count)) return 0;
     const row = (rigId
       ? this.db.prepare("SELECT seq FROM events WHERE rig_id = ? ORDER BY seq DESC LIMIT 1 OFFSET ?").get(rigId, count)
       : this.db.prepare("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET ?").get(count)) as { seq: number } | undefined;

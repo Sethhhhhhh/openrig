@@ -47,18 +47,19 @@ eventsRoute.get("/", (c) => {
       }
     });
 
-    // Where the replay starts, read once subscribed: an event stored after it is either replayed or buffered. Without
-    // Last-Event-ID, `?replay=<n>` replays the newest n (0: from now on); absent or `all`, the whole log.
-    const lastSeq = lastEventId !== null ? (isNaN(lastEventId) ? 0 : lastEventId)
-      : replay === undefined || replay === "all" ? 0
-      : eventBus.seqBeforeNewest(Number(replay), rigId);
-    maxReplayedSeq = lastSeq;
-
     const aborted = new Promise<void>((resolve) => {
       stream.onAbort(() => resolve());
     });
 
     try {
+      // Where the replay starts, read once subscribed: an event stored after it is either replayed or buffered. Without
+      // Last-Event-ID, `?replay=<n>` replays the newest n (0: from now on); absent, `all` or more than the log holds,
+      // the whole log.
+      const lastSeq = lastEventId !== null ? (isNaN(lastEventId) ? 0 : lastEventId)
+        : replay === undefined || replay === "all" ? 0
+        : eventBus.seqBeforeNewest(Number(replay), rigId);
+      maxReplayedSeq = lastSeq;
+
       // 2. Replay missed events from DB, a page at a time
       for (let page = eventBus.replayPage(lastSeq, REPLAY_PAGE, rigId); page.length > 0 && !stream.aborted;
         page = eventBus.replayPage(maxReplayedSeq, REPLAY_PAGE, rigId)) {
