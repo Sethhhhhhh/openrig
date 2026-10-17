@@ -227,9 +227,8 @@ SSE delivery surfaces include the following. The daemon has **11**
   - with a `Last-Event-ID` header (an `EventSource` sends it when it
     reconnects), every event after that `seq`, whatever `replay` says;
   - otherwise `?replay=<n>`: the newest `n` events (of the rig, with
-    `rigId`); `replay=0` starts from now; `replay=all`, no `replay`, or
-    a count past the log's size, replays the whole log. Any other value
-    is a `400`.
+    `rigId`); `replay=0` starts from now; `replay=all`, no `replay`, a
+    count past the log's size, or any other value, replays the whole log.
 
   Either way the replay ends at the newest event stored as the connection
   subscribes; the events stored meanwhile were buffered and follow it, each

@@ -283,11 +283,28 @@ describe("SSE events route", () => {
       await vi.waitFor(() => expect(eventBus.subscriberCount).toBe(countBefore), { timeout: 1000 });
     });
 
-    it("refuses a replay that is neither a number nor all", async () => {
-      for (const value of ["-1", "some", "1.5", ""]) {
-        const res = await app.request(`/api/events?replay=${value}`);
-        expect(res.status, value).toBe(400);
+    it("replays the whole log, as before, for a replay that is neither a count nor all", async () => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 3);
+      const values = ["-1", "1.5", "some", "", "%2B1", "%20", "1e2", "0x10", "ALL", "Infinity", "NaN", "%D9%A1", "1%0A"];
+      for (const value of values) {
+        const res = await app.request(`/api/events?rigId=${rig.id}&replay=${value}`);
+        expect(res.status, value).toBe(200);
+        expect(ids(await readSSEEvents(res, 3)), value).toEqual(seqs);
       }
+      const duplicate = await app.request(`/api/events?rigId=${rig.id}&replay=some&replay=0`);
+      expect(ids(await readSSEEvents(duplicate, 3))).toEqual(seqs);
+    });
+
+    it("Last-Event-ID resumes as before when replay is not recognized", async () => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 3);
+      for (const value of ["some", "-1", ""]) {
+        const res = await app.request(`/api/events?rigId=${rig.id}&replay=${value}`, { headers: { "Last-Event-ID": String(seqs[1]) } });
+        expect(ids(await readSSEEvents(res, 3, 200)), value).toEqual(seqs.slice(2));
+      }
+      const unparsed = await app.request(`/api/events?rigId=${rig.id}&replay=some`, { headers: { "Last-Event-ID": "abc" } });
+      expect(ids(await readSSEEvents(unparsed, 3))).toEqual(seqs);
     });
 
     it("streams a long replay a page at a time, every event once and in order", async () => {

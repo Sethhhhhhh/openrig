@@ -14,10 +14,10 @@ function getEventBus(c: { get: (key: string) => unknown }): EventBus {
 
 eventsRoute.get("/", (c) => {
   const rigId = c.req.query("rigId"); // Optional — omit for global stream
+  // `?replay=<n>` asks for the newest n events (0: none); `all`, no `replay` or any other value, the whole log, as before
+  // the parameter existed.
   const replay = c.req.query("replay");
-  if (replay !== undefined && replay !== "all" && !/^\d+$/.test(replay)) {
-    return c.json({ error: "replay must be a number of events (0 for none) or all" }, 400);
-  }
+  const replayCount = replay !== undefined && /^\d+$/.test(replay) ? Number(replay) : null;
 
   // EventSource sends Last-Event-ID when it reconnects: the events after it are replayed, whatever `replay` says.
   const lastEventIdRaw = c.req.header("Last-Event-ID");
@@ -53,11 +53,10 @@ eventsRoute.get("/", (c) => {
 
     try {
       // Where the replay starts, read once subscribed: an event stored after it is either replayed or buffered. Without
-      // Last-Event-ID, `?replay=<n>` replays the newest n (0: from now on); absent, `all` or more than the log holds,
-      // the whole log.
+      // Last-Event-ID, `?replay=<n>` replays the newest n (0: from now on), the whole log when it holds no more.
       const lastSeq = lastEventId !== null ? (isNaN(lastEventId) ? 0 : lastEventId)
-        : replay === undefined || replay === "all" ? 0
-        : eventBus.seqBeforeNewest(Number(replay), rigId);
+        : replayCount === null ? 0
+        : eventBus.seqBeforeNewest(replayCount, rigId);
       maxReplayedSeq = lastSeq;
       // Where it ends, read once subscribed too: an event stored after it is buffered, so events arriving while the
       // pages are written can neither keep the replay going nor be sent twice.
