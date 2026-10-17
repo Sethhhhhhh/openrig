@@ -211,13 +211,14 @@ export class EventBus {
 
   private pageStatements?: { all: Database.Statement; rig: Database.Statement };
 
-  /** Up to `limit` events after `seq`, oldest first, of one rig when `rigId` is given: a replay read a page at a time. */
-  replayPage(seq: number, limit: number, rigId?: string): PersistedEvent[] {
+  /** Up to `limit` events after `seq` and up to `upTo`, oldest first, of one rig when `rigId` is given: a replay read a
+   *  page at a time, which events stored meanwhile never lengthen. */
+  replayPage(seq: number, upTo: number, limit: number, rigId?: string): PersistedEvent[] {
     this.pageStatements ??= {
-      all: this.db.prepare("SELECT seq, rig_id, node_id, type, payload, created_at FROM events WHERE seq > ? ORDER BY seq LIMIT ?"),
-      rig: this.db.prepare("SELECT seq, rig_id, node_id, type, payload, created_at FROM events WHERE rig_id = ? AND seq > ? ORDER BY seq LIMIT ?"),
+      all: this.db.prepare("SELECT seq, rig_id, node_id, type, payload, created_at FROM events WHERE seq > ? AND seq <= ? ORDER BY seq LIMIT ?"),
+      rig: this.db.prepare("SELECT seq, rig_id, node_id, type, payload, created_at FROM events WHERE rig_id = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?"),
     };
-    const rows = (rigId ? this.pageStatements.rig.all(rigId, seq, limit) : this.pageStatements.all.all(seq, limit)) as EventRow[];
+    const rows = (rigId ? this.pageStatements.rig.all(rigId, seq, upTo, limit) : this.pageStatements.all.all(seq, upTo, limit)) as EventRow[];
     return rows.map((row) => this.rowToPersistedEvent(row));
   }
 
@@ -273,7 +274,8 @@ export class EventBus {
     }
   }
 
-  private maxSeq(): number {
+  /** The newest stored event's seq, 0 for an empty log. */
+  maxSeq(): number {
     const row = this.db.prepare("SELECT MAX(seq) AS seq FROM events").get() as {
       seq: number | null;
     };

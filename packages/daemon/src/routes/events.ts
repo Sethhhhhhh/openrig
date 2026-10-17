@@ -59,10 +59,13 @@ eventsRoute.get("/", (c) => {
         : replay === undefined || replay === "all" ? 0
         : eventBus.seqBeforeNewest(Number(replay), rigId);
       maxReplayedSeq = lastSeq;
+      // Where it ends, read once subscribed too: an event stored after it is buffered, so events arriving while the
+      // pages are written can neither keep the replay going nor be sent twice.
+      const upTo = eventBus.maxSeq();
 
       // 2. Replay missed events from DB, a page at a time
-      for (let page = eventBus.replayPage(lastSeq, REPLAY_PAGE, rigId); page.length > 0 && !stream.aborted;
-        page = eventBus.replayPage(maxReplayedSeq, REPLAY_PAGE, rigId)) {
+      for (let page = eventBus.replayPage(lastSeq, upTo, REPLAY_PAGE, rigId); page.length > 0 && !stream.aborted;
+        page = eventBus.replayPage(maxReplayedSeq, upTo, REPLAY_PAGE, rigId)) {
         for (const event of page) {
           await stream.writeSSE({ id: String(event.seq), data: JSON.stringify(event) });
           if (event.seq > maxReplayedSeq) maxReplayedSeq = event.seq;

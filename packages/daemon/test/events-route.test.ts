@@ -300,6 +300,24 @@ describe("SSE events route", () => {
       expect(replayAll).not.toHaveBeenCalled();
       expect(page.mock.calls.length).toBeGreaterThanOrEqual(3);
     });
+
+    it.each([
+      ["replay=all", {}],
+      ["Last-Event-ID", { "Last-Event-ID": "0" }],
+    ])("a replay (%s) ends at the newest event stored as it connects, those arriving meanwhile sent once after it", async (_, headers) => {
+      const rig = rigRepo.createRig("r01");
+      const seqs = emitMany(rig.id, 1201);
+      const replayPage = eventBus.replayPage.bind(eventBus);
+      const emitted: number[] = [];
+      const page = vi.spyOn(eventBus, "replayPage").mockImplementation((...args) => {
+        emitted.push(eventBus.emit({ type: "rig.created", rigId: rig.id }).seq);
+        return replayPage(...args);
+      });
+      const res = await app.request(`/api/events?rigId=${rig.id}&replay=all`, { headers });
+      const events = await readSSEEvents(res, 1201 + 50, 1500);
+      expect(page.mock.calls.length).toBeLessThanOrEqual(4);
+      expect(ids(events)).toEqual([...seqs, ...emitted]);
+    });
   });
 
   it("production app mounts /api/events (regression)", async () => {
