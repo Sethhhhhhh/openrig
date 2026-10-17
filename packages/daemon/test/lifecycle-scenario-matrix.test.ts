@@ -414,14 +414,14 @@ describe("Lifecycle reboot/recovery scenario matrix (Tier 1)", () => {
         if (!r.ok) expect(r.code).toBe("retry_fresh");
       });
 
-      it("pane returns to shell → {ok:false, code:'retry_fresh'} (NOT silent ok:true)", async () => {
+      it("a shell label with no proof the shell is idle → {ok:false, code:'attention_required'} (NOT silent ok:true)", async () => {
         const tmux = mockTmuxForRestore({ paneCommand: "zsh", paneContent: "" });
         const adapter = new CodexResumeAdapter(tmux, fastOptions);
 
         const r = await adapter.resume("r99-worker", "codex_id", "tok-abc", "/tmp");
 
         expect(r.ok).toBe(false);
-        if (!r.ok) expect(r.code).toBe("retry_fresh");
+        if (!r.ok) expect(r.code).toBe("attention_required");
       });
 
       // Codex auth-refusal → attention_required end-to-end. Closes the
