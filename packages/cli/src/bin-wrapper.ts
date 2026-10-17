@@ -9,8 +9,9 @@ import type { RunProgramIo } from "./cli-error.js";
 
 const REEXEC_GUARD_ENV = "OPENRIG_BIN_REEXEC";
 
-// Each `rig` is a new process: Node (22.1 and later) keeps the modules it compiled on disk so the
-// next call skips compiling them again. Node 22.0 has no such call.
+// Each `rig` is a new process: Node's on-disk compile cache lets the next call skip compiling the modules
+// again. The cache dates from Node v22.1.0, but this JavaScript API from v22.8.0: before it, `?.()` does
+// nothing. NODE_COMPILE_CACHE and NODE_DISABLE_COMPILE_CACHE still control it.
 module.enableCompileCache?.();
 
 export function resolveBinEntry(invokedPath = process.argv[1], moduleUrl = import.meta.url): string {
