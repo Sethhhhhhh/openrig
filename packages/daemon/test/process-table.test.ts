@@ -9,11 +9,13 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...actual, default: actual, readFileSync: vi.fn(actual.readFileSync) };
 });
 import { readProcessTable, readProcTable } from "../src/domain/process-table.js";
-import { claudeCommandSessionToken, listNativeProcesses, processArgv } from "../src/domain/native-process-lineage.js";
+import { claudeCommandSessionToken, listNativeProcesses, processArgv, verifyPaneIdleShell } from "../src/domain/native-process-lineage.js";
 import { defaultListProcessesStrict } from "../src/domain/resume-metadata-refresher.js";
+import { restoreProc, serveProcRoot, writeFakeProc } from "./helpers/fake-proc.js";
 
 let scratch: string | undefined;
 afterEach(() => {
+  restoreProc();
   vi.unstubAllEnvs();
   if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
   scratch = undefined;
@@ -95,6 +97,37 @@ describe("readProcTable", () => {
     const rows = await pending.finally(() => { reading = false; vi.mocked(readFileSync).mockImplementation(actual); });
     expect(rows).toHaveLength(120);
     expect(events.join("").split("|").filter(Boolean).map((slice) => slice.length)).toEqual([50, 50, 20]);
+  });
+
+  it("keeps a process whose command line cannot be read by its name in brackets, and drops one that is gone", async () => {
+    const root = fakeProc(0, {
+      7: { stat: stat(7, "node", "S", 1, 7, 7, 0), cmdline: "" },
+      8: { stat: stat(8, "node", "S", 1, 8, 8, 0), cmdline: "" },
+    });
+    // A command line that cannot be read, short of the process being gone (EISDIR here, as root reads past a permission).
+    fs.rmSync(path.join(root, "7", "cmdline"));
+    fs.mkdirSync(path.join(root, "7", "cmdline"));
+    // A process that exited between its stat and its command line.
+    fs.rmSync(path.join(root, "8", "cmdline"));
+    expect(await readProcTable(root)).toEqual([
+      { pid: 7, ppid: 1, pgid: 7, tpgid: 7, executableName: "node", startedAt: expect.any(String), command: "[node]" },
+    ]);
+  });
+
+  it("keeps a pane's shell from reading idle when its foreground child's command line cannot be read", async () => {
+    const started = "Sat Jan  1 12:00:00 2000";
+    const root = writeFakeProc([
+      { pid: 101, ppid: 1, pgid: 101, tpgid: 101, name: "zsh", startedAt: started, command: "-zsh" },
+      { pid: 102, ppid: 101, pgid: 101, tpgid: 101, name: "vim", startedAt: started, command: "vim notes" },
+    ]);
+    serveProcRoot(root);
+    const tmux = { getPanePid: async () => 101 };
+    fs.rmSync(path.join(root, "102", "cmdline"));
+    fs.mkdirSync(path.join(root, "102", "cmdline"));
+    expect(await verifyPaneIdleShell({ target: "s:0.0", tmux })).toBe(false);
+    // Gone, the child no longer holds the foreground.
+    fs.rmSync(path.join(root, "102"), { recursive: true });
+    expect(await verifyPaneIdleShell({ target: "s:0.0", tmux })).toBe(true);
   });
 
   it("rejects when there is no process table to read", async () => {

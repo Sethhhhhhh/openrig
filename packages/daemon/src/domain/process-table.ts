@@ -96,15 +96,24 @@ export async function readProcTable(root = "/proc"): Promise<ProcessTableRow[]> 
   return rows;
 }
 
+/** The errors of a read under /proc/<pid> once the process has exited. */
+const PROCESS_GONE = new Set(["ENOENT", "ESRCH"]);
+
 function readProcRow(root: string, pid: string, bootTime: number): ProcessTableRow | null {
   let stat: string;
-  let cmdline: string;
   try {
     // latin1: one character a byte, so names are cut and printed on bytes as ps does.
     stat = readFileSync(`${root}/${pid}/stat`, "latin1");
-    cmdline = readFileSync(`${root}/${pid}/cmdline`, "latin1");
   } catch {
-    return null; // exited between the listing and the read
+    return null; // exited between the listing and the read; without its stat ps lists nothing of it either
+  }
+  let cmdline = "";
+  try {
+    cmdline = readFileSync(`${root}/${pid}/cmdline`, "latin1");
+  } catch (error) {
+    // Only a process that is gone is dropped. One whose command line cannot be read (denied, say) is still running,
+    // and its foreground still counts: ps lists it by its name in brackets.
+    if (PROCESS_GONE.has((error as NodeJS.ErrnoException).code ?? "")) return null;
   }
   // `pid (comm) state ppid pgrp session tty_nr tpgid …`: comm may hold spaces and parentheses, so fields count from
   // its last `)`; the start time is the 22nd field, in ticks since boot.
@@ -113,7 +122,7 @@ function readProcRow(root: string, pid: string, bootTime: number): ProcessTableR
   if (close < 0 || fields.length < 20) return null;
   const comm = stat.slice(stat.indexOf("(") + 1, close);
   const name = printable(comm);
-  // A kernel thread or a zombie has no command line: ps shows its name in brackets.
+  // A kernel thread or a zombie has no command line, and an unreadable one shows none: ps shows its name in brackets.
   const command = printable(cmdline.replace(/[\0\n]/g, " ")).trim()
     || `[${name}]${fields[0] === "Z" ? " <defunct>" : ""}`;
   return {
