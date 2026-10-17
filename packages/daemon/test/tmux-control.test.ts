@@ -56,6 +56,20 @@ describe("ControlReplies", () => {
     expect(answers).toEqual([{ ok: true, lines: [], overflow: true }, { ok: true, lines: ["ok"] }]);
   });
 
+  it("counts a line with no end yet in bytes: four-byte characters past the bound are dropped before their newline", () => {
+    const { replies: r, answers } = replies(128);
+    r.push("%begin 1 1 0\n%end 1 1 0\n%begin 1 2 1\n");
+    r.push("😀".repeat(50));
+    // 200 bytes, in 100 UTF-16 units: past the bound already, so not held until the newline.
+    expect(r["partial"]).toBe("");
+    r.push("\n%end 1 2 1\n%begin 1 3 1\n");
+    // 126 bytes in 63 units: within it, and held.
+    r.push("é".repeat(63));
+    expect(r["partial"]).toBe("é".repeat(63));
+    r.push("\n%end 1 3 1\n");
+    expect(answers).toEqual([{ ok: true, lines: [], overflow: true }, { ok: true, lines: ["é".repeat(63)] }]);
+  });
+
   it("fails what is still waiting when the client is gone", () => {
     const r = new ControlReplies();
     const errors: string[] = [];

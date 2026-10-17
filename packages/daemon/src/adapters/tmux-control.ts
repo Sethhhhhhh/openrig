@@ -199,7 +199,9 @@ export class ControlReplies {
       if (this.skipping) this.skipping = false;
       else this.line(line);
     }
-    if (this.partial.length > this.maxBytes) {
+    // In bytes, as the bound is: a UTF-16 unit is 1 to 3 bytes, so the count is taken only when the length cannot tell.
+    const units = this.partial.length;
+    if (units > this.maxBytes || (units * 3 > this.maxBytes && Buffer.byteLength(this.partial) > this.maxBytes)) {
       this.partial = "";
       this.skipping = true;
       this.overflowed();
