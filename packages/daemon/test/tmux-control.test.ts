@@ -50,21 +50,40 @@ describe("ControlReplies", () => {
   });
 });
 
+/** The line the exec writes to ask whether only control sessions are left on the server. */
+const ALONE_CHECK = "'list-sessions' '-F' '#{@openrig-control}'";
+
 /** A control client that records the command lines written to it and answers only when told to. It attaches at once
- *  unless told to wait. */
-function fakeClient(options: { attach?: boolean } = {}) {
+ *  unless told to wait. The checks for control sessions alone are answered from `checks` in turn (by default, one
+ *  answer: a session of no daemon's is left), then recorded as any other line. Its input closed, it exits, as tmux's
+ *  client detaches. */
+function fakeClient(options: { attach?: boolean; checks?: string[][] } = {}) {
   const child = Object.assign(new EventEmitter(), {
-    stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn(() => true), unref: () => {},
+    stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    exitCode: null as number | null, signalCode: null as string | null, unref: () => {},
+    kill: vi.fn((): boolean => { setImmediate(exit); return true; }),
   });
+  const checks = [...(options.checks ?? [[""]])];
   const written: string[] = [];
-  child.stdin.setEncoding("utf8");
-  child.stdin.on("data", (chunk: string) => written.push(...chunk.split("\n").filter(Boolean)));
-  const attach = () => child.stdout.write("%begin 1 1 0\n%end 1 1 0\n");
-  if (options.attach !== false) setImmediate(attach);
   let n = 1;
   const answer = (...lines: string[]) => { n++; child.stdout.write(`%begin 1 ${n} 1\n${lines.map((l) => `${l}\n`).join("")}%end 1 ${n} 1\n`); };
-  const exit = () => child.emit("exit", null, "SIGTERM");
-  return { child: child as unknown as ChildProcessWithoutNullStreams, kill: child.kill, written, answer, attach, exit };
+  child.stdin.setEncoding("utf8");
+  child.stdin.on("data", (chunk: string) => {
+    for (const line of chunk.split("\n").filter(Boolean)) {
+      if (line === ALONE_CHECK && checks.length > 0) answer(...checks.shift()!);
+      else written.push(line);
+    }
+  });
+  let ended = false;
+  child.stdin.on("finish", () => { ended = true; setImmediate(exit); });
+  const attach = () => child.stdout.write("%begin 1 1 0\n%end 1 1 0\n");
+  if (options.attach !== false) setImmediate(attach);
+  function exit() {
+    if (child.signalCode !== null) return;
+    child.signalCode = "SIGTERM";
+    child.emit("exit", null, "SIGTERM");
+  }
+  return { child: child as unknown as ChildProcessWithoutNullStreams, kill: child.kill, written, answer, attach, exit, ended: () => ended };
 }
 
 /** The spawned tmux the control exec falls back to: its own call (the server's version, read before a client starts)
@@ -73,9 +92,9 @@ function fakeSpawned(answer: (argv: string[]) => string | Promise<string> = () =
   const spawned: string[][] = [];
   const own: string[][] = [];
   const fallback = async (argv: string[]): Promise<string> => {
-    if (argv[1] === "list-sessions" && argv[3] === "#{version}") {
+    if (argv[1] === "list-sessions" && argv[3]?.startsWith("#{version}")) {
       own.push(argv);
-      return "3.6\n3.6\n";
+      return "3.6|\n3.6|\n";
     }
     spawned.push(argv);
     return answer(argv);
@@ -144,8 +163,11 @@ describe("tmuxControlExec", () => {
     await exec.close();
   });
 
-  it("starts no client while no server runs, or one before tmux 3.2, and asks again only after a while", async () => {
-    for (const server of [() => { throw new Error("no server running on /tmp/tmux-1000/default"); }, () => "3.1c\n", () => ""]) {
+  it("starts no client while no server runs, one before tmux 3.2, or one with control sessions only, and asks again only after a while", async () => {
+    const servers = [
+      () => { throw new Error("no server running on /tmp/tmux-1000/default"); }, () => "3.1c|\n", () => "", () => "3.6|d4e5\n3.6|ffff0000\n",
+    ];
+    for (const server of servers) {
       const spawned: string[][] = [];
       let clock = 0;
       const exec = tmuxControlExec(async (argv) => {
@@ -272,7 +294,7 @@ describe("tmuxControlExec", () => {
     expect(await read).toBe("");
     expect(spawned.map((argv) => argv[1])).toEqual(["has-session", "has-session"]);
     await exec.close();
-    expect(clients[1]!.kill).toHaveBeenCalled();
+    expect(clients[1]!.ended()).toBe(true);
   });
 
   it("closed while its client attaches, ends that client, then spawns what it is given", async () => {
@@ -291,6 +313,58 @@ describe("tmuxControlExec", () => {
     expect(spawned).toHaveLength(2);
     expect(started).toBe(1);
     expect(client.written).toEqual([]);
+  });
+
+  it("retires its client once only control sessions are left, after the call running on it, and starts one again while sessions remain", async () => {
+    const clients = [fakeClient({ checks: [[""]] }), fakeClient()];
+    let started = 0;
+    const { own, fallback } = fakeSpawned();
+    const exec = tmuxControlExec(fallback, { spawnClient: () => clients[started++]!.child, owner: "d4e5", replyTimeoutMs: 1000 });
+    const first = clients[0]!;
+    const chain = exec(["tmux", "display-message", "-p", "-t", "=s:", "c1", ";", "display-message", "-p", "-t", "=s:", "c2"]);
+    await vi.waitFor(() => expect(first.written).toHaveLength(1));
+    // The last session of no daemon's is destroyed while the chain runs.
+    first.child.stdout.write("%sessions-changed\n");
+    await vi.waitFor(() => expect(first.written).toEqual([expect.stringContaining("c1"), ALONE_CHECK]));
+    first.answer("c1");
+    await vi.waitFor(() => expect(first.written).toHaveLength(3));
+    first.answer("d4e5", "ffff0000");
+    // Retired: no new call goes to it, and it ends once the chain is done.
+    expect(first.ended()).toBe(false);
+    first.answer("c2");
+    expect(await chain).toBe("c1\nc2\n");
+    await vi.waitFor(() => expect(first.ended()).toBe(true));
+    expect(first.kill).not.toHaveBeenCalled();
+    // A session came back: the next call asks the server again and starts a new client.
+    const read = exec(["tmux", "has-session", "-t", "=s"]);
+    await vi.waitFor(() => expect(clients[1]!.written).toHaveLength(1));
+    clients[1]!.answer();
+    await read;
+    expect(own).toHaveLength(2);
+    expect(first.written).toHaveLength(3);
+    await exec.close();
+    expect(clients[1]!.ended()).toBe(true);
+  });
+
+  it("retires a client that finds itself alone as it attaches: the server lost its last other session meanwhile", async () => {
+    const client = fakeClient({ checks: [] });
+    const spawned: string[][] = [];
+    const probes = ["3.6|\n", "3.6|d4e5\n"];
+    const exec = tmuxControlExec(async (argv) => {
+      if (argv[1] === "list-sessions") return probes.shift()!;
+      spawned.push(argv);
+      return "spawned\n";
+    }, { spawnClient: () => client.child, owner: "d4e5", replyTimeoutMs: 1000 });
+    const read = exec(["tmux", "has-session", "-t", "=s"]);
+    await vi.waitFor(() => expect(client.written).toEqual([ALONE_CHECK, "'has-session' '-t' '=s'"]));
+    client.answer("d4e5");
+    client.answer();
+    expect(await read).toBe("");
+    await vi.waitFor(() => expect(client.ended()).toBe(true));
+    // The next call finds only control sessions: spawned, and no client started.
+    expect(await exec(["tmux", "has-session", "-t", "=s"])).toBe("spawned\n");
+    expect(spawned.map((a) => a[1])).toEqual(["has-session"]);
+    await exec.close();
   });
 
   it("leaves out of a listing only the rows of its own session and client, once it has one", async () => {

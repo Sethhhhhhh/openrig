@@ -155,6 +155,8 @@ export class ControlReplies {
   onAttached?: (ok: boolean) => void;
   /** Called after each command's reply. */
   onReply?: () => void;
+  /** Called on tmux's `%sessions-changed`: a session was made or destroyed on the server. */
+  onSessionsChanged?: () => void;
 
   get closed(): boolean {
     return this.failure !== null;
@@ -184,6 +186,8 @@ export class ControlReplies {
       if (line.startsWith("%begin ")) {
         this.header = line.slice("%begin ".length);
         this.lines = [];
+      } else if (line === "%sessions-changed") {
+        this.onSessionsChanged?.();
       }
       return;
     }
@@ -246,7 +250,14 @@ interface ControlClient {
   headSince: number;
   /** Fires once that wait is past the reply timeout. */
   timer?: ReturnType<typeof setTimeout>;
+  /** The calls running on it. */
+  users: number;
+  /** Set once it takes no new call: it ends as soon as the calls running on it are done. */
+  retiring: boolean;
 }
+
+/** How long the end of a client (its input closed) may take before it is killed. */
+const END_MS = 2_000;
 
 export type TmuxControlExec = ArgvExecFn & { close: () => Promise<void>; owner: string };
 
@@ -268,22 +279,54 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
   /** Set once a client of this daemon attached: from then on its session may exist, and listings mark its rows. */
   let attachedOnce = false;
   let closed = false;
+  /** Every client of this daemon still running: the current one, one attaching, and those retiring. */
+  const live = new Set<ControlClient>();
+  /** Gives up the attach under way: the daemon is stopping. */
+  let cancelAttach: (() => void) | null = null;
 
   const backOff = (): void => {
     retryAt = now() + RETRY_MS[Math.min(failures, RETRY_MS.length - 1)]!;
     failures++;
   };
 
-  /** Ends the client and fails what it still owes. One that ended on its own is started again after a while; one
-   *  dropped for a reply overdue, at the next command. */
-  const drop = (child: ChildProcessWithoutNullStreams, reason: string, overdue = false): void => {
-    if (client?.child !== child) return;
-    clearTimeout(client.timer);
-    client.replies.failAll(new Error(`tmux control client ended: ${reason}`));
+  /** Ends a client at once and fails what it still owes. The current one, when it ended on its own, is started again
+   *  after a while; when dropped for a reply overdue, at the next command. */
+  const drop = (c: ControlClient, reason: string, overdue = false): void => {
+    clearTimeout(c.timer);
+    c.replies.failAll(new Error(`tmux control client ended: ${reason}`));
+    if (c.child.exitCode === null && c.child.signalCode === null) c.child.kill();
+    if (client !== c) return;
     client = null;
     if (overdue) retryAt = 0;
     else backOff();
-    child.kill();
+  };
+
+  /** Ends a client as tmux ends one whose input closes: it detaches, after answering what it was sent, and tmux
+   *  destroys its session (`destroy-unattached`). Killed if it has not gone within END_MS. */
+  const end = (c: ControlClient): Promise<void> => new Promise((resolve) => {
+    if (!live.has(c)) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      drop(c, "did not end");
+      resolve();
+    }, END_MS);
+    c.child.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    c.child.stdin.end();
+  });
+
+  /** Takes no new call on the client, and ends it once the calls running on it are done. */
+  const retire = (c: ControlClient): void => {
+    c.retiring = true;
+    if (client === c) {
+      client = null;
+      retryAt = 0;
+    }
+    if (c.users === 0) void end(c);
   };
 
   /** Drops the client once the command at the head of its line has waited past the reply timeout: every later command
@@ -292,7 +335,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     clearTimeout(c.timer);
     if (c.replies.waiting === 0) return;
     c.timer = setTimeout(() => {
-      if (now() - c.headSince >= replyTimeoutMs) drop(c.child, `no reply within ${replyTimeoutMs} ms`, true);
+      if (now() - c.headSince >= replyTimeoutMs) drop(c, `no reply within ${replyTimeoutMs} ms`, true);
       else watch(c);
     }, Math.max(0, c.headSince + replyTimeoutMs - now()));
     c.timer.unref?.();
@@ -308,13 +351,13 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     ";", "set-option", "detach-on-destroy", "on",
   ];
 
-  /** Whether a server runs that a control client may attach to: one with a session, of tmux 3.2 or later (its own
-   *  version, not the tmux binary's), read by a spawned client. With none, the client is not started, so it never
-   *  starts a server. */
+  /** Whether a server runs that a control client may attach to: one of tmux 3.2 or later (its own version, not the
+   *  tmux binary's) with a session that is no control session, read by a spawned client. With none, no client is
+   *  started: it never starts a server, nor keeps one up that would exit without it (`checkAlone`). */
   const serverReady = async (): Promise<boolean> => {
     try {
-      const listing = await fallback(["tmux", "list-sessions", "-F", "#{version}"]);
-      return supportsControlMode(listing.split("\n")[0] ?? "");
+      const rows = (await fallback(["tmux", "list-sessions", "-F", `#{version}|#{${CONTROL_OPTION}}`])).split("\n").filter(Boolean);
+      return supportsControlMode(rows[0] ?? "") && rows.some((row) => row.endsWith("|"));
     } catch {
       return false;
     }
@@ -328,33 +371,46 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     if (closed) return null;
     const child = spawnClient(clientArgs());
     const replies = new ControlReplies();
-    const started: ControlClient = { child, replies, headSince: 0 };
+    const started: ControlClient = { child, replies, headSince: 0, users: 0, retiring: false };
+    live.add(started);
     replies.onReply = () => {
       started.headSince = now();
       watch(started);
     };
+    replies.onSessionsChanged = () => checkAlone(started);
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => replies.push(chunk));
     child.stderr.resume();
-    child.on("error", (err) => drop(child, err.message));
-    child.on("exit", (code, signal) => drop(child, `exited (${signal ?? code})`));
-    child.stdin.on("error", (err) => drop(child, err.message));
+    child.on("error", (err) => drop(started, err.message));
+    child.on("exit", (code, signal) => {
+      live.delete(started);
+      drop(started, `exited (${signal ?? code})`);
+    });
+    child.stdin.on("error", (err) => drop(started, err.message));
     // The daemon's exit is never held by its control client.
     child.unref();
     for (const stream of [child.stdin, child.stdout, child.stderr] as unknown[]) (stream as { unref?: () => void }).unref?.();
     const attached = await new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(false), replyTimeoutMs);
-      replies.onAttached = (ok) => { clearTimeout(timer); resolve(ok); };
-      child.once("exit", () => { clearTimeout(timer); resolve(false); });
+      const settle = (ok: boolean) => {
+        clearTimeout(timer);
+        cancelAttach = null;
+        resolve(ok);
+      };
+      replies.onAttached = settle;
+      cancelAttach = () => settle(false);
+      child.once("exit", () => settle(false));
     });
     attachedOnce ||= attached;
     client = started;
     if (!attached || closed) {
-      drop(child, closed ? "closed" : "did not attach");
+      drop(started, closed ? "closed" : "did not attach");
       return null;
     }
     failures = 0;
-    return client;
+    // The server may have lost its last other session while this one was made.
+    checkAlone(started);
+    return started;
   };
 
   const connected = async (): Promise<ControlClient | null> => {
@@ -369,8 +425,8 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
    *  command waits behind a client that stopped answering, and every reply stays its own command's. */
   const send = (target: ControlClient, args: string[]): Promise<{ ok: boolean; lines: string[] }> =>
     new Promise((resolve, reject) => {
-      // A chain's client may have ended after an earlier command's reply: nothing is written to it.
-      if (target.replies.closed) {
+      // A chain's client may have ended after an earlier command's reply, or be ending: nothing is written to it.
+      if (target.replies.closed || target.child.stdin.writableEnded) {
         reject(NOT_WRITTEN);
         return;
       }
@@ -379,6 +435,16 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       target.child.stdin.write(`${args.map(quote).join(" ")}\n`);
       watch(target);
     });
+
+  /** Retires the client once every session left on the server is a control session, this daemon's or another's:
+   *  it would otherwise keep up a server that, as with spawned clients only, exits with its last session. Asked as the
+   *  client attaches and at each `%sessions-changed`; a later command starts a client again while sessions remain. */
+  const checkAlone = (c: ControlClient): void => {
+    if (client !== c) return;
+    send(c, ["list-sessions", "-F", `#{${CONTROL_OPTION}}`]).then((reply) => {
+      if (reply.ok && reply.lines.every((line) => line !== "")) retire(c);
+    }, () => { /* the client is gone already */ });
+  };
 
   /** The error of a write whose client ended before its reply, with what a spawned client finds of its target now: a
    *  server or session gone reads as a spawned client's failure would (`no server running`, `can't find session`), so
@@ -409,32 +475,40 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     const own = (text: string): string => marked ? withoutOwnRows(text, owner) : text;
     const target = routable ? await connected() : null;
     if (!target) return own(await fallback(argv));
-    const commands = commandsOf(argv.slice(1));
-    let stdout = "";
-    for (const [index, command] of commands.entries()) {
-      let reply: { ok: boolean; lines: string[] };
-      try {
-        reply = await send(target, command);
-      } catch (err) {
-        // The call is run again by a spawned client only when no write of it was written: reads, and a write that
-        // never reached the client. A write that was (this one, or one earlier in the chain) may have taken effect, so
-        // the call fails, and the commands before this one are not run again.
-        const written = commands.slice(0, err === NOT_WRITTEN ? index : index + 1);
-        if (written.some((c) => !READS.has(c[0]!))) throw await failedWrite(command, err as Error);
-        return own(await fallback(argv));
+    target.users++;
+    try {
+      const commands = commandsOf(argv.slice(1));
+      let stdout = "";
+      for (const [index, command] of commands.entries()) {
+        let reply: { ok: boolean; lines: string[] };
+        try {
+          reply = await send(target, command);
+        } catch (err) {
+          // The call is run again by a spawned client only when no write of it was written: reads, and a write that
+          // never reached the client. A write that was (this one, or one earlier in the chain) may have taken effect,
+          // so the call fails, and the commands before this one are not run again.
+          const written = commands.slice(0, err === NOT_WRITTEN ? index : index + 1);
+          if (written.some((c) => !READS.has(c[0]!))) throw await failedWrite(command, err as Error);
+          return own(await fallback(argv));
+        }
+        const text = own(reply.lines.length > 0 ? `${reply.lines.join("\n")}\n` : "");
+        if (!reply.ok) throw commandFailed(argvIn, stdout, text);
+        stdout += text;
       }
-      const text = own(reply.lines.length > 0 ? `${reply.lines.join("\n")}\n` : "");
-      if (!reply.ok) throw commandFailed(argvIn, stdout, text);
-      stdout += text;
+      return stdout;
+    } finally {
+      target.users--;
+      if (target.retiring && target.users === 0) void end(target);
     }
-    return stdout;
   };
 
-  /** Ends the client, one being started included: the daemon is stopping. tmux destroys its session as it leaves. */
+  /** Ends every client, one attaching included, each after what it was sent: the daemon is stopping. tmux destroys
+   *  their sessions as they leave. */
   const close = async (): Promise<void> => {
     closed = true;
+    cancelAttach?.();
     await starting;
-    if (client) drop(client.child, "closed");
+    await Promise.all([...live].map(end));
   };
 
   return Object.assign(exec, { close, owner });
