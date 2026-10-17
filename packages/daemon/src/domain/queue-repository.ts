@@ -3439,10 +3439,11 @@ export class QueueRepository {
         `SELECT ${columns} FROM queue_items ${where} ORDER BY ${orderBy} LIMIT ?`
       )
       .all(...params) as QueueItemRow[];
-    const ledgers = this.deliveryOutcomesFor(rows);
+    const owners = this.transitionLog.ownerNotificationsForQitems(rows.map((row) => row.qitem_id));
+    const ledgers = this.deliveryOutcomesFor(rows, owners);
     const items = rows.map((r) => {
-      const item = this.rowToItem(r, !opts?.compact);
-      const ledger = ledgers.get(item.qitemId);
+      const ledger = ledgers.get(r.qitem_id);
+      const item = this.rowToItem(r, !opts?.compact, { owners: owners.get(r.qitem_id) ?? [], ledger: ledger ?? null });
       return {
         ...item,
         deliveryOutcome: ledger?.outcome ?? null,
@@ -3821,12 +3822,12 @@ export class QueueRepository {
    *  to a registered human, aliases included) has a POSTED receipt. Legacy rows with no OWNER
    *  history, inactive episodes, never-posted and transport-failed all read false. Same derivation
    *  as deliveryOutcomeFor; it reads row fields, never the waiting view. */
-  humanNotificationPostedThisEpisode(qitemId: string): boolean {
+  humanNotificationPostedThisEpisode(qitemId: string, listed?: ListedLedger): boolean {
     if (!this.hasQueueTransitionsTable) return false;
     // Only the ask's own notification binds a recipient: create writes it in state pending, to the destination of
     // that moment. A park notice (its recipient is not retained), a resolution notice, or a later destination change
     // (routeToFallback opens no new episode) cannot establish that the current destination received this ask.
-    const owners = this.transitionLog.ownerNotificationsForQitems([qitemId]).get(qitemId) ?? [];
+    const owners = listed?.owners ?? this.transitionLog.ownerNotificationsForQitems([qitemId]).get(qitemId) ?? [];
     const owner = owners[0];
     if (!owner || owner.state !== "pending") return false;
     if (owner.ownerNotificationKind !== "human-required" && owner.ownerNotificationKind !== "human-update") return false;
@@ -3835,7 +3836,7 @@ export class QueueRepository {
     ).get(qitemId, owner.transitionId);
     if (rerouted) return false;
     // The ledger's episode exists only when the destination resolves to a registered human (aliases included).
-    const ledger = this.deliveryLedger(qitemId, owners);
+    const ledger = listed ? listed.ledger : this.deliveryLedger(qitemId, owners);
     return ledger !== null && ledger.outcome === "posted" && ledger.episode?.notificationKey === `${qitemId}:${owner.transitionId}`;
   }
 
@@ -4132,12 +4133,13 @@ export class QueueRepository {
     try { return this.activityReader?.(session) ?? null; } catch { return null; }
   }
 
-  waitingView(qitemId: string): WaitingView | null {
+  /** listed: the row's owner notifications and ledger, when a listing read them for all its rows. */
+  waitingView(qitemId: string, listed?: ListedLedger): WaitingView | null {
     const view = readWaitingView(this.db, qitemId, this.activityReader);
     if (view && ["pending", "in-progress"].includes(view.state)) {
       // #514 — the unclaimed sweep skips a pending ask already posted to its human in the current
       // episode (same predicate as runStuckSweep), so the view must not promise that sweep.
-      const awaitingHuman = view.state === "pending" && this.humanNotificationPostedThisEpisode(qitemId);
+      const awaitingHuman = view.state === "pending" && this.humanNotificationPostedThisEpisode(qitemId, listed);
       if (awaitingHuman) {
         view.nextBackstop = { owner: view.owner, mechanism: "none (posted to the human; awaiting their decision)", dueAt: null, intervalSeconds: null };
       }
@@ -4183,11 +4185,11 @@ export class QueueRepository {
     };
   }
 
-  private rowToItem(row: QueueItemRow, includeWaiting = true): QueueItem {
+  private rowToItem(row: QueueItemRow, includeWaiting = true, listed?: ListedLedger): QueueItem {
     // S04 — derive the pickup receipt at the ONE shared projection point (list/show/overdue
     // all flow through here), so the park-vs-strand question is answered by the row face.
     const meaningful = lastMeaningfulTransition(this.db, row.qitem_id);
-    const waiting = includeWaiting ? this.waitingView(row.qitem_id) : null;
+    const waiting = includeWaiting ? this.waitingView(row.qitem_id, listed) : null;
     const activity = this.ownerActivity(row.destination_session);
     const pickup = derivePickup({
       state: row.state,
@@ -4249,6 +4251,9 @@ export class QueueRepository {
 type LedgerItem = Pick<QueueItem, "qitemId" | "state" | "blockedOn" | "destinationSession" | "tsCreated" | "lastNudgeResult">;
 
 type DeliveryLedger = { outcome: "posted" | "transport-failed" | "never-posted"; detail: string; episode: { notificationKey: string; startedAt: string } | null };
+
+/** A listed row's owner notifications (newest first) and its delivery ledger, read once for the whole listing. */
+type ListedLedger = { owners: QueueTransition[]; ledger: DeliveryLedger | null };
 
 function ledgerItem(row: LedgerRow): LedgerItem {
   return {

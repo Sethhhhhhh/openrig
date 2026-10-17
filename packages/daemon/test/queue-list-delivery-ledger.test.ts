@@ -138,18 +138,24 @@ describe("queue list: delivery ledgers", () => {
     expect(JSON.stringify(items)).toBe(JSON.stringify(perRow(failing, items)));
   });
 
-  it("reads the ledgers of a whole listing with statements prepared once, and the human registry once", async () => {
+  it.each([true, false])("reads the ledgers of a whole listing with statements prepared once, and the human registry once (compact: %s)", async (compact) => {
     await seed();
-    repo.list({ limit: 1000, compact: true });
+    repo.list({ limit: 1000, compact });
     const prepare = vi.spyOn(db, "prepare");
     loadRegistry.mockClear();
-    const ledgerReads = () => prepare.mock.calls.filter(([sql]) => /slack-owner-notification|owner_notification_level IS NOT NULL/.test(sql));
-    repo.list({ limit: 1000, compact: true });
-    expect(ledgerReads()).toEqual([]);
+    // A full row's waiting view asks, for a pending row, whether its ask was posted to its human: from the listing's reads.
+    const items = repo.list({ limit: 1000, compact });
+    expect(items.some((item) => item.state === "pending" && item.deliveryOutcome === "posted")).toBe(true);
+    expect(prepare.mock.calls.filter(([sql]) => /slack-owner-notification|owner_notification_level IS NOT NULL/.test(sql))).toEqual([]);
     expect(loadRegistry).toHaveBeenCalledTimes(1);
-    // The full rows' waiting view still asks, for a pending row only, whether its ask was posted to its human.
-    const pending = repo.list({ limit: 1000 }).filter((item) => item.state === "pending").length;
-    expect(ledgerReads().filter(([sql]) => sql.includes("slack-owner-notification")).length).toBeLessThanOrEqual(pending);
     prepare.mockRestore();
+  });
+
+  it("tells a full row's waiting view its ask was posted to its human, as the row alone does", async () => {
+    await seed();
+    const listed = repo.list({ limit: 1000 }).filter((item) => item.state === "pending");
+    const awaiting = listed.filter((item) => item.waiting?.nextBackstop?.mechanism.startsWith("none (posted to the human"));
+    expect(awaiting.length).toBeGreaterThan(0);
+    expect(listed.map((item) => item.waiting)).toEqual(listed.map((item) => repo.waitingView(item.qitemId)));
   });
 });
