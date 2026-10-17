@@ -86,13 +86,18 @@ export function canLoadInstalledNative(node: string, wrapper: string): boolean {
 }
 
 /** A command whose modules cannot be loaded fails as any other command does: the shared error object on stdout under
- *  `--json`, `error: …` on stderr otherwise, and exit 1. */
+ *  `--json`, `error: …` on stderr otherwise, and exit 1. A human run also gets the stack, which names the module and
+ *  line that failed, as Node's own crash did. */
 function failedToLoad(argv: string[], error: unknown, io: RunProgramIo): void {
   const failure = formatCliError(error);
   const out = io.out ?? ((l: string) => process.stdout.write(l + "\n"));
   const err = io.err ?? ((l: string) => process.stderr.write(l + "\n"));
-  if (wantsJsonOutput(argv.slice(2))) out(JSON.stringify(failure));
-  else err(`error: ${failure.error.message}`);
+  if (wantsJsonOutput(argv.slice(2))) {
+    out(JSON.stringify(failure));
+  } else {
+    err(`error: ${failure.error.message}`);
+    if (error instanceof Error && error.stack) err(error.stack);
+  }
   (io.exit ?? ((c: number) => process.exit(c)))(1);
 }
 

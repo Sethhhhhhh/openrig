@@ -77,7 +77,10 @@ describe("bin-wrapper", () => {
     const human = await run1("queue", "list");
     expect(human.codes).toEqual([1]);
     expect(human.out).toEqual([]);
-    expect(human.err).toEqual([`error: ${parsed.error.message}`]);
+    expect(human.err).toHaveLength(2);
+    expect(human.err[0]).toBe(`error: ${parsed.error.message}`);
+    expect(human.err[1]).toContain("commands/queue.js");
+    expect(human.err[1]).toMatch(/\n\s+at /);
   });
 
   it("does not re-exec when already running under the sibling node", () => {
