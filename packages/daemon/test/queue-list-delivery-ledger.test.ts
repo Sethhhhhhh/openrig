@@ -1,5 +1,6 @@
-// The queue listing derives every row's delivery ledger in a few batched reads, and gives what the per-row derivation
-// (deliveryOutcomeFor, which show and the sweeps keep) gives, byte for byte.
+// The queue listing derives every row's delivery ledger in a few batched reads. Each seeded shape's outcome is pinned
+// (the per-row derivation this batching replaced gave the same), and a row's ledger in a listing is the one it has on
+// its own (deliveryOutcomeFor, the batch of one that show and the sweeps read), byte for byte.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { createDb } from "../src/db/connection.js";
 import { migrate } from "../src/db/migrate.js";
@@ -11,6 +12,8 @@ import type { HumanFragment, LoadResult } from "../src/domain/gateway/human-regi
 
 const FOUNDER = { entityId: "human-founder", class: "human", displayName: "F", address: "human-founder@external",
   connectorBindings: [{ connector: "slack", ref: "U0F", primary: true }], prefs: {} } as unknown as HumanFragment;
+
+type Outcome = "posted" | "transport-failed" | "never-posted" | null;
 
 describe("queue list: delivery ledgers", () => {
   let db: ReturnType<typeof createDb>, repo: QueueRepository, loadRegistry: ReturnType<typeof vi.fn<() => LoadResult>>;
@@ -30,60 +33,109 @@ describe("queue list: delivery ledgers", () => {
       ...extra } as never);
     return (item as unknown as { qitemId: string }).qitemId;
   }
+  const closeByHuman = (id: string) => repo.update({ qitemId: id, actorSession: "human-founder@external", state: "done", closureReason: "no-follow-on",
+    transitionNote: "direct human reply received", ownerNotificationKind: "human-decision-resolved" } as never);
+  const ARCHIVE_COLUMNS = "transition_id, qitem_id, ts, state, transition_note, actor_session, owner_notification_kind, owner_notification_level";
+  /** Moves one transition to the archive table, as retention does a closed row's. */
+  function archive(transitionId: number): void {
+    db.prepare(`INSERT INTO queue_transitions_archive (${ARCHIVE_COLUMNS}, archived_at) SELECT ${ARCHIVE_COLUMNS}, ts FROM queue_transitions WHERE transition_id = ?`).run(transitionId);
+    db.prepare("DELETE FROM queue_transitions WHERE transition_id = ?").run(transitionId);
+  }
 
-  /** Every ledger the derivation knows: posted, transport-failed, never-posted, a closed row's resolved notice, a row
-   *  parked on the human, legacy gateway-owned nudges, a receipt of an earlier episode, and rows with none. Returns the
-   *  legacy rows with no receipt. */
-  async function seed(): Promise<string[]> {
-    const legacyUnposted: string[] = [];
-    for (let i = 0; i < 4; i++) {
-      receipt(await create("human-founder@external", { humanIntent: "decision" }), "posted");
-      receipt(await create("human-founder@external", { humanIntent: "decision" }), "transport-failed");
-      await create("human-founder@external", { humanIntent: "decision" });
+  /** Every ledger the derivation knows, each row with its outcome when the human registry loads and when it fails:
+   *  posted, transport-failed, never-posted, a closed row's resolved notice, a row parked on the human, legacy
+   *  gateway-owned nudges, a receipt of an earlier episode, owner notices in the archive table, ids JSON and LIKE treat
+   *  specially, rows inside the post window, and rows with no ledger. */
+  async function seed(): Promise<Array<{ id: string; ok: Outcome; failed: Outcome }>> {
+    const rows: Array<{ id: string; ok: Outcome; failed: Outcome }> = [];
+    const add = (id: string, ok: Outcome, failed: Outcome = null) => rows.push({ id, ok, failed });
+    for (let i = 0; i < 2; i++) {
+      const posted = await create("human-founder@external", { humanIntent: "decision" });
+      receipt(posted, "posted");
+      add(posted, "posted");
+      const failed = await create("human-founder@external", { humanIntent: "decision" });
+      receipt(failed, "transport-failed");
+      add(failed, "transport-failed");
+      add(await create("human-founder@external", { humanIntent: "decision" }), "never-posted");
       const closed = await create("human-founder@external", { humanIntent: "decision" });
       receipt(closed, "posted");
-      repo.update({ qitemId: closed, actorSession: "human-founder@external", state: "done", closureReason: "no-follow-on",
-        transitionNote: "direct human reply received", ownerNotificationKind: "human-decision-resolved" } as never);
+      closeByHuman(closed);
+      add(closed, "posted");
       const unposted = await create("human-founder@external", { humanIntent: "decision" });
-      repo.update({ qitemId: unposted, actorSession: "human-founder@external", state: "done", closureReason: "no-follow-on",
-        transitionNote: "direct human reply received", ownerNotificationKind: "human-decision-resolved" } as never);
+      closeByHuman(unposted);
+      add(unposted, "never-posted");
       const parked = await create("dev@rig");
       repo.update({ qitemId: parked, actorSession: "dev@rig", state: "blocked", blockedOn: "human-founder@external", transitionNote: "needs the owner" } as never);
       receipt(parked, "posted", `${parked}:0`);
+      add(parked, "never-posted");
       const legacy = await create("dev@rig");
       repo.recordNudgeAttempt(legacy, "gateway-owned: slack");
       receipt(legacy, "transport-failed", "none");
+      add(legacy, "transport-failed", "transport-failed");
       // No owner history and no receipt: only last_nudge_result (a compact column) makes it never-posted. Created
       // without its wake, which would overwrite that result.
-      const noReceipt = await create("dev@rig", { nudge: false });
-      repo.recordNudgeAttempt(noReceipt, "gateway-owned: slack");
-      legacyUnposted.push(noReceipt);
-      await create("dev@rig");
+      const legacyUnposted = await create("dev@rig", { nudge: false });
+      repo.recordNudgeAttempt(legacyUnposted, "gateway-owned: slack");
+      add(legacyUnposted, "never-posted", "never-posted");
+      add(await create("dev@rig"), null);
+      // A closed row whose posted ask lives in the archive table: the resolved notice falls back to it.
+      const archivedAsk = await create("human-founder@external", { humanIntent: "decision" });
+      const ask = repo.transitionLog.latestOwnerNotificationForQitem(archivedAsk)!.transitionId;
+      receipt(archivedAsk, "posted");
+      closeByHuman(archivedAsk);
+      archive(ask);
+      add(archivedAsk, "posted");
+      // A newer ask in the archive table than the live receipt's: the receipt is an earlier episode's.
+      const archivedLatest = await create("human-founder@external", { humanIntent: "decision" });
+      receipt(archivedLatest, "posted");
+      const asksAgain = db.prepare(`INSERT INTO queue_transitions (qitem_id, ts, state, transition_note, actor_session, owner_notification_kind, owner_notification_level)
+        VALUES (?, ?, 'pending', 'asks again', 'lead@rig', 'human-required', 'ALERT')`).run(archivedLatest, new Date().toISOString());
+      archive(Number(asksAgain.lastInsertRowid));
+      add(archivedLatest, "never-posted");
+      for (const odd of [`q%${i}`, `q_${i}`, `q\\${i}`, `q"${i}`]) {
+        await create("human-founder@external", { qitemId: odd, humanIntent: "decision" });
+        receipt(odd, i === 0 ? "posted" : "transport-failed");
+        add(odd, i === 0 ? "posted" : "transport-failed");
+      }
     }
-    db.prepare("UPDATE queue_transitions SET ts = datetime('now', '-1 hour')").run();
+    for (const table of ["queue_transitions", "queue_transitions_archive"]) db.prepare(`UPDATE ${table} SET ts = datetime('now', '-1 hour')`).run();
     db.prepare("UPDATE queue_items SET ts_created = datetime('now', '-1 hour')").run();
-    return legacyUnposted;
+    // Inside the post window: no verdict yet.
+    add(await create("human-founder@external", { humanIntent: "decision" }), null);
+    const legacyFresh = await create("dev@rig", { nudge: false });
+    repo.recordNudgeAttempt(legacyFresh, "gateway-owned: slack");
+    add(legacyFresh, null);
+    return rows;
   }
 
-  /** The listing as the per-row derivation builds it: each item's own fields, then its ledger's. */
-  function perRow<T extends { qitemId: string; deliveryOutcome?: unknown; deliveryFailureDetail?: unknown }>(items: T[]): unknown[] {
+  /** The listing as each row's own ledger builds it: each item's own fields, then its ledger's. */
+  function perRow<T extends { qitemId: string; deliveryOutcome?: unknown; deliveryFailureDetail?: unknown }>(from: QueueRepository, items: T[]): unknown[] {
     return items.map(({ deliveryOutcome: _outcome, deliveryFailureDetail: _detail, ...item }) => {
-      const ledger = repo.deliveryOutcomeFor(item.qitemId);
+      const ledger = from.deliveryOutcomeFor(item.qitemId);
       return { ...item, deliveryOutcome: ledger?.outcome ?? null, ...(ledger && ledger.outcome !== "posted" ? { deliveryFailureDetail: ledger.detail } : {}) };
     });
   }
 
-  it("gives each row the ledger deliveryOutcomeFor gives it, byte for byte", async () => {
-    const legacyUnposted = await seed();
+  it("gives each seeded shape its outcome, and each row the ledger it has on its own, byte for byte", async () => {
+    const rows = await seed();
     const items = repo.list({ limit: 1000 });
-    expect(items).toHaveLength(36);
-    expect(new Set(items.map((item) => item.deliveryOutcome))).toEqual(new Set(["posted", "transport-failed", "never-posted", null]));
-    expect(JSON.stringify(items)).toBe(JSON.stringify(perRow(items)));
+    expect(items).toHaveLength(rows.length);
+    const outcomes = new Map(items.map((item) => [item.qitemId, item.deliveryOutcome]));
+    expect(rows.map((row) => [row.id, outcomes.get(row.id)])).toEqual(rows.map((row) => [row.id, row.ok]));
+    expect(JSON.stringify(items)).toBe(JSON.stringify(perRow(repo, items)));
     const compact = repo.list({ limit: 1000, compact: true });
     expect(compact.map((item) => [item.qitemId, item.deliveryOutcome, (item as { deliveryFailureDetail?: string }).deliveryFailureDetail]))
       .toEqual(items.map((item) => [item.qitemId, item.deliveryOutcome, item.deliveryFailureDetail]));
-    expect(compact.filter((item) => legacyUnposted.includes(item.qitemId)).map((item) => item.deliveryOutcome))
-      .toEqual(["never-posted", "never-posted", "never-posted", "never-posted"]);
+  });
+
+  it("gives no human episode a verdict when the human registry fails to load", async () => {
+    const rows = await seed();
+    const failing = new QueueRepository(db, new EventBus(db), { transport: { send: async () => ({ ok: true, verified: true }) },
+      loadHumanRegistry: () => ({ ok: false, error: "unreadable" }) as unknown as LoadResult });
+    const items = failing.list({ limit: 1000 });
+    const outcomes = new Map(items.map((item) => [item.qitemId, item.deliveryOutcome]));
+    expect(rows.map((row) => [row.id, outcomes.get(row.id)])).toEqual(rows.map((row) => [row.id, row.failed]));
+    expect(JSON.stringify(items)).toBe(JSON.stringify(perRow(failing, items)));
   });
 
   it("reads the ledgers of a whole listing with statements prepared once, and the human registry once", async () => {
