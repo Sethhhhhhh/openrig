@@ -2,7 +2,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import { ControlReplies, supportsControlMode, tmuxControlExec, withoutControlSession } from "../src/adapters/tmux-control.js";
+import { commandsOf, ControlReplies, supportsControlMode, tmuxControlExec, withoutControlSession } from "../src/adapters/tmux-control.js";
 
 function replies(): { replies: ControlReplies; answers: Array<{ ok: boolean; lines: string[] }>; attached: () => boolean } {
   const r = new ControlReplies();
@@ -143,6 +143,33 @@ describe("tmuxControlExec", () => {
 });
 
 describe("control-mode rules", () => {
+  it("splits and unescapes the argv's commands at ; as a spawned tmux does", () => {
+    expect(commandsOf(["display-message", "-p", "abc;", "list-sessions"])).toEqual([["display-message", "-p", "abc"], ["list-sessions"]]);
+    expect(commandsOf(["display-message", "-p", "abc\\;"])).toEqual([["display-message", "-p", "abc;"]]);
+    expect(commandsOf(["display-message", "-p", "abc\\\\;"])).toEqual([["display-message", "-p", "abc\\;"]]);
+    expect(commandsOf(["display-message", "-p", "\\;", ";", "has-session"])).toEqual([["display-message", "-p", ";"], ["has-session"]]);
+    expect(commandsOf([";", "has-session", ";", ";", "list-sessions", ";"])).toEqual([["has-session"], ["list-sessions"]]);
+    expect(commandsOf(["send-keys", "-l", "a;b", "it's"])).toEqual([["send-keys", "-l", "a;b", "it's"]]);
+  });
+
+  it("writes each command of the argv on its own line, its arguments as tmux read them", async () => {
+    const client = fakeClient();
+    const exec = tmuxControlExec(async (argv) => {
+      if (argv[1] === "-V") return "tmux 3.6\n";
+      if (argv[1] === "has-session") return "";
+      throw new Error(`spawned: ${argv.join(" ")}`);
+    }, { spawnClient: () => client.child, replyTimeoutMs: 1000 });
+
+    const run = exec(["tmux", "display-message", "-p", "-t", "=s:", "abc;", "display-message", "-p", "-t", "=s:", "x\\;"]);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1));
+    client.answer("abc");
+    await vi.waitFor(() => expect(client.written).toHaveLength(2));
+    client.answer("x;");
+    expect(await run).toBe("abc\nx;\n");
+    expect(client.written).toEqual(["'display-message' '-p' '-t' '=s:' 'abc'", "'display-message' '-p' '-t' '=s:' 'x;'"]);
+    exec.close();
+  });
+
   it("needs tmux 3.2 or later", () => {
     expect(supportsControlMode("tmux 3.3a\n")).toBe(true);
     expect(supportsControlMode("tmux 3.2")).toBe(true);

@@ -37,13 +37,27 @@ function namesItsTarget(args: string[]): boolean {
   return false;
 }
 
-/** The argv's commands, split where it chains them with a bare `;` (as tmux's own command line does). */
-function commandsOf(args: string[]): string[][] {
-  const commands: string[][] = [[]];
+/** The argv's commands, as a spawned tmux reads its arguments (cmd-parse.c): an argument ending in `;` ends its
+ *  command and keeps the rest (`abc;` is `abc`, then a new command); one ending in `\;` is kept with a literal `;`
+ *  instead (`abc\;` is `abc;`). An empty command is skipped. Each argument is then sent quoted, as it reads. */
+export function commandsOf(args: string[]): string[][] {
+  const commands: string[][] = [];
+  let command: string[] = [];
   for (const arg of args) {
-    if (arg === ";") commands.push([]);
-    else commands[commands.length - 1]!.push(arg);
+    if (!arg.endsWith(";")) {
+      command.push(arg);
+      continue;
+    }
+    const rest = arg.slice(0, -1);
+    if (rest.endsWith("\\")) {
+      command.push(`${rest.slice(0, -1)};`);
+      continue;
+    }
+    if (rest !== "") command.push(rest);
+    if (command.length > 0) commands.push(command);
+    command = [];
   }
+  if (command.length > 0) commands.push(command);
   return commands;
 }
 
@@ -279,8 +293,9 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
 
   const exec = async (argvIn: string[]): Promise<string> => {
     const [bin, ...argsIn] = argvIn;
-    const routable = bin === "tmux" && argsIn.length > 0 && !argsIn[0]!.startsWith("-")
-      && commandsOf(argsIn).every((c) => c.length > 0 && ROUTED.has(c[0]!) && namesItsTarget(c))
+    const commandsIn = commandsOf(argsIn);
+    const routable = bin === "tmux" && argsIn.length > 0 && !argsIn[0]!.startsWith("-") && commandsIn.length > 0
+      && commandsIn.every((c) => ROUTED.has(c[0]!) && namesItsTarget(c))
       && argsIn.every((a) => !/[\n\r\0]/.test(a));
     const target = routable ? await connected() : null;
     // Once tmux is known to filter (3.2 and later), the control session may exist: every listing leaves it out.

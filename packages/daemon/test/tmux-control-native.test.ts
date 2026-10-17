@@ -26,6 +26,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 describe.skipIf(!supportsControlMode(version))("tmux control mode against a real server", () => {
   let dir: string;
   let control: ReturnType<typeof tmuxControlExec>;
+  /** What the control exec handed to a spawned client. */
+  let spawned: string[][];
   const tmux = (...args: string[]) => execFileSync("tmux", args, { encoding: "utf8" });
 
   beforeEach(() => {
@@ -35,7 +37,8 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     // A pane that prints what an agent could: UTF-8, a tab, a line that reads like the end of a control block.
     writeFileSync(join(dir, "screen.txt"), "héllo wörld 日本\nа\tb\n%end 1792181738 374 1\n%error 1 2 3\nlast line\n");
     tmux("new-session", "-d", "-s", "seat@rig", "-x", "120", "-y", "30", `cat ${join(dir, "screen.txt")}; exec cat`);
-    control = tmuxControlExec(execArgvCommand);
+    spawned = [];
+    control = tmuxControlExec((argv) => { spawned.push(argv); return execArgvCommand(argv); });
   });
 
   afterEach(() => {
@@ -59,15 +62,24 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     ["tmux", "list-panes", "-a", "-F", "#{session_name}|#{pane_id}|#{pane_current_command}"],
     ["tmux", "list-panes", "-t", "=seat@rig:", "-F", "#{pane_id}|#{pane_index}|#{pane_width}|#{pane_height}|#{pane_active}"],
     ["tmux", "show-environment", "-t", "=seat@rig"],
+    // An argument ending in ; ends its command; one ending in \; keeps a literal ;; empty commands are skipped.
+    ["tmux", "display-message", "-p", "-t", "=seat@rig:", "abc;", "display-message", "-p", "-t", "=seat@rig:", "second"],
+    ["tmux", "display-message", "-p", "-t", "=seat@rig:", "abc\\;"],
+    ["tmux", "display-message", "-p", "-t", "=seat@rig:", "abc\\\\;"],
+    ["tmux", "display-message", "-p", "-t", "=seat@rig:", "\\;", ";", ";", "display-message", "-p", "-t", "=seat@rig:", "a;b;"],
+    ["tmux", "display-message", "-p", "-t", "=seat@rig:", "x", ";"],
   ];
 
   it("gives every read the spawned client's stdout, error text and execStderr", async () => {
     await sleep(300);
     await control(["tmux", "has-session", "-t", "=seat@rig"]); // connects: the control session exists from here on
+    const connecting = spawned.length;
     for (const argv of reads) {
-      const spawned = await outcome(execArgvCommand, withoutControlSession(argv));
-      expect(await outcome(control, argv), argv.join(" ")).toEqual(spawned);
+      const expected = await outcome(execArgvCommand, withoutControlSession(argv));
+      expect(await outcome(control, argv), argv.join(" ")).toEqual(expected);
     }
+    // Every one of them went through the control client.
+    expect(spawned.slice(connecting)).toEqual([]);
   });
 
   it("answers each command with its own output while a user's after-hook prints blocks between them", async () => {
