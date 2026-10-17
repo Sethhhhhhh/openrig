@@ -32,8 +32,10 @@ describe("queue list: delivery ledgers", () => {
   }
 
   /** Every ledger the derivation knows: posted, transport-failed, never-posted, a closed row's resolved notice, a row
-   *  parked on the human, a legacy gateway-owned nudge, a receipt of an earlier episode, and rows with none. */
-  async function seed(): Promise<void> {
+   *  parked on the human, legacy gateway-owned nudges, a receipt of an earlier episode, and rows with none. Returns the
+   *  legacy rows with no receipt. */
+  async function seed(): Promise<string[]> {
+    const legacyUnposted: string[] = [];
     for (let i = 0; i < 4; i++) {
       receipt(await create("human-founder@external", { humanIntent: "decision" }), "posted");
       receipt(await create("human-founder@external", { humanIntent: "decision" }), "transport-failed");
@@ -51,10 +53,16 @@ describe("queue list: delivery ledgers", () => {
       const legacy = await create("dev@rig");
       repo.recordNudgeAttempt(legacy, "gateway-owned: slack");
       receipt(legacy, "transport-failed", "none");
+      // No owner history and no receipt: only last_nudge_result (a compact column) makes it never-posted. Created
+      // without its wake, which would overwrite that result.
+      const noReceipt = await create("dev@rig", { nudge: false });
+      repo.recordNudgeAttempt(noReceipt, "gateway-owned: slack");
+      legacyUnposted.push(noReceipt);
       await create("dev@rig");
     }
     db.prepare("UPDATE queue_transitions SET ts = datetime('now', '-1 hour')").run();
     db.prepare("UPDATE queue_items SET ts_created = datetime('now', '-1 hour')").run();
+    return legacyUnposted;
   }
 
   /** The listing as the per-row derivation builds it: each item's own fields, then its ledger's. */
@@ -66,14 +74,16 @@ describe("queue list: delivery ledgers", () => {
   }
 
   it("gives each row the ledger deliveryOutcomeFor gives it, byte for byte", async () => {
-    await seed();
+    const legacyUnposted = await seed();
     const items = repo.list({ limit: 1000 });
-    expect(items).toHaveLength(32);
+    expect(items).toHaveLength(36);
     expect(new Set(items.map((item) => item.deliveryOutcome))).toEqual(new Set(["posted", "transport-failed", "never-posted", null]));
     expect(JSON.stringify(items)).toBe(JSON.stringify(perRow(items)));
     const compact = repo.list({ limit: 1000, compact: true });
     expect(compact.map((item) => [item.qitemId, item.deliveryOutcome, (item as { deliveryFailureDetail?: string }).deliveryFailureDetail]))
       .toEqual(items.map((item) => [item.qitemId, item.deliveryOutcome, item.deliveryFailureDetail]));
+    expect(compact.filter((item) => legacyUnposted.includes(item.qitemId)).map((item) => item.deliveryOutcome))
+      .toEqual(["never-posted", "never-posted", "never-posted", "never-posted"]);
   });
 
   it("reads the ledgers of a whole listing with statements prepared once, and the human registry once", async () => {

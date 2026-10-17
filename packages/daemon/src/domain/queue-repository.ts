@@ -585,8 +585,17 @@ function compactRow(item: QueueItem): CompactQueueItem {
   return row as unknown as CompactQueueItem;
 }
 
-const COMPACT_QUEUE_COLUMNS =
-  "qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, blocked_on, handed_off_to, handed_off_from, expires_at, closure_reason, closure_target, closure_required_at, claimed_at, last_nudge_attempt, last_nudge_result, last_heartbeat, resolution, target_repo";
+const COMPACT_QUEUE_COLUMN_NAMES = [
+  "qitem_id", "ts_created", "ts_updated", "source_session", "destination_session", "state", "priority", "tier", "tags",
+  "blocked_on", "handed_off_to", "handed_off_from", "expires_at", "closure_reason", "closure_target", "closure_required_at",
+  "claimed_at", "last_nudge_attempt", "last_nudge_result", "last_heartbeat", "resolution", "target_repo",
+] as const;
+const COMPACT_QUEUE_COLUMNS = COMPACT_QUEUE_COLUMN_NAMES.join(", ");
+
+/** The row fields a delivery ledger reads. A compact listing selects only COMPACT_QUEUE_COLUMN_NAMES, so each must be
+ *  one of them: dropping one from that list leaves its field off this type, and its read fails to compile. */
+type LedgerRow = Pick<QueueItemRow, Extract<(typeof COMPACT_QUEUE_COLUMN_NAMES)[number],
+  "qitem_id" | "state" | "blocked_on" | "destination_session" | "ts_created" | "last_nudge_result" | "claimed_at">>;
 
 /**
  * Stamp-at-FORWARD only (founder root invariant 2026-08-27, superseding 51-09 incr 4
@@ -3856,7 +3865,7 @@ export class QueueRepository {
 
   /** deliveryOutcomeFor for every row of a listing, with its reads batched: one read of the rows' owner notifications,
    *  one of their receipts, the human registry loaded once at most. */
-  private deliveryOutcomesFor(rows: QueueItemRow[]): Map<string, DeliveryLedger> {
+  private deliveryOutcomesFor(rows: LedgerRow[]): Map<string, DeliveryLedger> {
     const ledgers = new Map<string, DeliveryLedger>();
     if (!this.hasQueueTransitionsTable || rows.length === 0) return ledgers;
     const qitemIds = rows.map((row) => row.qitem_id);
@@ -4250,7 +4259,7 @@ type LedgerItem = Pick<QueueItem, "qitemId" | "state" | "blockedOn" | "destinati
 
 type DeliveryLedger = { outcome: "posted" | "transport-failed" | "never-posted"; detail: string; episode: { notificationKey: string; startedAt: string } | null };
 
-function ledgerItem(row: QueueItemRow): LedgerItem {
+function ledgerItem(row: LedgerRow): LedgerItem {
   return {
     qitemId: row.qitem_id,
     state: row.state as QueueState,
