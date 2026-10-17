@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -63,41 +64,54 @@ function printable(text: string): string {
   return text.replace(/[\u0000-\u001f\u007f]/g, ".");
 }
 
-/** The process table read from /proc (`root` for tests): the rows ps would print, without a process of its own. The
- *  reads are synchronous: some 500 small files from the kernel take ~7 ms, where as many asynchronous reads cost ten
- *  times that in the thread pool, as much CPU as the `ps` they replace. */
+/** Pids read between two turns of the event loop: some 2 ms of reads at ~40 µs a pid. */
+const PIDS_PER_SLICE = 50;
+
+const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/** The process table read from /proc (`root` for tests): the rows ps would print, without a process of its own. Each
+ *  pid's two files are read synchronously, where as many asynchronous reads cost ten times that in the thread pool, as
+ *  much CPU as the `ps` they replace; but the listing is asynchronous and the event loop is handed back every
+ *  PIDS_PER_SLICE pids, so a host with thousands of processes never stalls the daemon for the whole table. */
 export async function readProcTable(root = "/proc"): Promise<ProcessTableRow[]> {
-  const entries = readdirSync(root);
+  const pids = (await readdir(root)).filter((entry) => /^\d+$/.test(entry));
   const bootTime = Number(/^btime (\d+)$/m.exec(readFileSync(`${root}/stat`, "utf8"))?.[1]);
   if (!Number.isFinite(bootTime)) throw new Error(`${root}/stat has no btime`);
-  const rows = entries.filter((entry) => /^\d+$/.test(entry)).map((entry): ProcessTableRow | null => {
-    let stat: string;
-    let cmdline: string;
-    try {
-      stat = readFileSync(`${root}/${entry}/stat`, "utf8");
-      cmdline = readFileSync(`${root}/${entry}/cmdline`, "utf8");
-    } catch {
-      return null; // exited between the listing and the read
-    }
-    // `pid (comm) state ppid pgrp session tty_nr tpgid …`: comm may hold spaces and parentheses, so fields count from
-    // its last `)`; the start time is the 22nd field, in ticks since boot.
-    const close = stat.lastIndexOf(")");
-    const fields = stat.slice(close + 2).split(" ");
-    if (close < 0 || fields.length < 20) return null;
-    const name = printable(stat.slice(stat.indexOf("(") + 1, close));
-    // A kernel thread or a zombie has no command line: ps shows its name in brackets.
-    const command = printable(cmdline.replace(/[\0\n]/g, " ")).trim()
-      || `[${name}]${fields[0] === "Z" ? " <defunct>" : ""}`;
-    return {
-      pid: Number(entry),
-      ppid: Number(fields[1]),
-      pgid: Number(fields[2]),
-      tpgid: Number(fields[5]),
-      // The kernel may give a worker thread a longer name; ucomm is the task name's 15 bytes.
-      executableName: Buffer.from(name).subarray(0, 15).toString(),
-      startedAt: lstart(bootTime + Math.floor(Number(fields[19]) / TICKS_PER_SECOND)),
-      command,
-    };
-  });
-  return rows.filter((row): row is ProcessTableRow => row !== null);
+  const rows: ProcessTableRow[] = [];
+  for (let i = 0; i < pids.length; i++) {
+    if (i > 0 && i % PIDS_PER_SLICE === 0) await nextTurn();
+    const row = readProcRow(root, pids[i]!, bootTime);
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
+function readProcRow(root: string, pid: string, bootTime: number): ProcessTableRow | null {
+  let stat: string;
+  let cmdline: string;
+  try {
+    stat = readFileSync(`${root}/${pid}/stat`, "utf8");
+    cmdline = readFileSync(`${root}/${pid}/cmdline`, "utf8");
+  } catch {
+    return null; // exited between the listing and the read
+  }
+  // `pid (comm) state ppid pgrp session tty_nr tpgid …`: comm may hold spaces and parentheses, so fields count from
+  // its last `)`; the start time is the 22nd field, in ticks since boot.
+  const close = stat.lastIndexOf(")");
+  const fields = stat.slice(close + 2).split(" ");
+  if (close < 0 || fields.length < 20) return null;
+  const name = printable(stat.slice(stat.indexOf("(") + 1, close));
+  // A kernel thread or a zombie has no command line: ps shows its name in brackets.
+  const command = printable(cmdline.replace(/[\0\n]/g, " ")).trim()
+    || `[${name}]${fields[0] === "Z" ? " <defunct>" : ""}`;
+  return {
+    pid: Number(pid),
+    ppid: Number(fields[1]),
+    pgid: Number(fields[2]),
+    tpgid: Number(fields[5]),
+    // The kernel may give a worker thread a longer name; ucomm is the task name's 15 bytes.
+    executableName: Buffer.from(name).subarray(0, 15).toString(),
+    startedAt: lstart(bootTime + Math.floor(Number(fields[19]) / TICKS_PER_SECOND)),
+    command,
+  };
 }

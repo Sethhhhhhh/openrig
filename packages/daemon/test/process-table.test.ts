@@ -1,8 +1,13 @@
 import { execFileSync } from "node:child_process";
-import fs from "node:fs";
+import fs, { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+// readFileSync passes through, watched by the slicing test.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, default: actual, readFileSync: vi.fn(actual.readFileSync) };
+});
 import { readProcessTable, readProcTable } from "../src/domain/process-table.js";
 import { listNativeProcesses } from "../src/domain/native-process-lineage.js";
 import { defaultListProcessesStrict } from "../src/domain/resume-metadata-refresher.js";
@@ -49,6 +54,27 @@ describe("readProcTable", () => {
       { pid: 41, ppid: 40, pgid: 41, tpgid: 41, executableName: "claude", startedAt: "Tue Oct  6 10:00:00 2026", command: "claude --resume tok-1 a.b x y é" },
       { pid: 42, ppid: 40, pgid: 41, tpgid: 41, executableName: "sh", startedAt: "Tue Oct  6 10:00:00 2026", command: "[sh] <defunct>" },
     ]);
+  });
+
+  it("hands the event loop back while it lists, then every 50 pids, so a large table never blocks it whole", async () => {
+    const pids = Array.from({ length: 120 }, (_, i) => i + 1);
+    const root = fakeProc(0, Object.fromEntries(pids.map((pid) => [pid, { stat: stat(pid, "sleep", "S", 1, pid, -1, 0), cmdline: "sleep\0" }])));
+    // Each pid's stat read is an `r`, each turn of the loop a `|`.
+    const events: string[] = [];
+    const actual = vi.mocked(readFileSync).getMockImplementation()!;
+    vi.mocked(readFileSync).mockImplementation(((file: string, options: never) => {
+      if (/\/\d+\/stat$/.test(file)) events.push("r");
+      return actual(file, options);
+    }) as typeof readFileSync);
+    let reading = true;
+    const turn = () => { events.push("|"); if (reading) setImmediate(turn); };
+    setImmediate(turn);
+    const pending = readProcTable(root);
+    // Nothing is read before the loop has turned.
+    expect(events).toEqual([]);
+    const rows = await pending.finally(() => { reading = false; vi.mocked(readFileSync).mockImplementation(actual); });
+    expect(rows).toHaveLength(120);
+    expect(events.join("").split("|").filter(Boolean).map((slice) => slice.length)).toEqual([50, 50, 20]);
   });
 
   it("rejects when there is no process table to read", async () => {
