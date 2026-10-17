@@ -46,6 +46,10 @@ const ROUTED = new Set([
 
 const LISTINGS = new Set(["list-sessions", "list-windows", "list-panes", "list-clients"]);
 
+/** The routed commands that change nothing, which may be run again after their client is lost. Any other one
+ *  (`send-keys`, `paste-buffer`, `delete-buffer`) is a write: once written, it may have taken effect. */
+const READS = new Set([...LISTINGS, "capture-pane", "display-message", "has-session", "show-environment"]);
+
 /** Whether a command acts on the same target from any client: a control client's own session would otherwise be the
  *  "current" one that a target-less command reads. */
 function namesItsTarget(args: string[]): boolean {
@@ -406,17 +410,17 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     const target = routable ? await connected() : null;
     if (!target) return own(await fallback(argv));
     const commands = commandsOf(argv.slice(1));
-    const writes = commands.some((c) => c[0] === "send-keys" || c[0] === "paste-buffer");
     let stdout = "";
     for (const [index, command] of commands.entries()) {
       let reply: { ok: boolean; lines: string[] };
       try {
         reply = await send(target, command);
       } catch (err) {
-        // A read, or a call of which nothing was written, is run again by a spawned client. A write fails when its
-        // client ended (or was dropped, its line overdue) after it was written: it may have landed, so its failure is
-        // reported, never repeated.
-        if (writes && !(err === NOT_WRITTEN && index === 0)) throw await failedWrite(command, err as Error);
+        // The call is run again by a spawned client only when no write of it was written: reads, and a write that
+        // never reached the client. A write that was (this one, or one earlier in the chain) may have taken effect, so
+        // the call fails, and the commands before this one are not run again.
+        const written = commands.slice(0, err === NOT_WRITTEN ? index : index + 1);
+        if (written.some((c) => !READS.has(c[0]!))) throw await failedWrite(command, err as Error);
         return own(await fallback(argv));
       }
       const text = own(reply.lines.length > 0 ? `${reply.lines.join("\n")}\n` : "");

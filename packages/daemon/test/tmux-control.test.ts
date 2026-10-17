@@ -195,6 +195,39 @@ describe("tmuxControlExec", () => {
     await exec.close();
   });
 
+  it("never runs a delete-buffer again once written: it may have taken effect", async () => {
+    const client = fakeClient();
+    const { spawned, fallback } = fakeSpawned();
+    const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, replyTimeoutMs: 1000 });
+    const deleted = exec(["tmux", "delete-buffer", "-b", "b1"]).then(() => null, (err: Error) => err.message);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1), { interval: 5 });
+    client.exit();
+    expect(await deleted).toBe("tmux control client ended: exited (SIGTERM)");
+    expect(spawned).toEqual([]);
+    await exec.close();
+  });
+
+  it("spawns a chain again only when none of its writes was written; one written fails the call, its prefix not run again", async () => {
+    for (const [argv, outcome] of [
+      // The client ends once the read is answered: the send-keys was never written, so the chain is spawned whole.
+      [["tmux", "display-message", "-p", "-t", "=s:", "x", ";", "send-keys", "-t", "=s:", "Enter"], "spawned"],
+      // The client ends once the send-keys is answered: it ran, so the read after it fails the call instead.
+      [["tmux", "send-keys", "-t", "=s:", "Enter", ";", "display-message", "-p", "-t", "=s:", "x"], "failed"],
+    ] as const) {
+      const client = fakeClient();
+      const { spawned, fallback } = fakeSpawned(() => "spawned\n");
+      const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, replyTimeoutMs: 1000 });
+      const run = exec([...argv]).then(() => "spawned", (err: Error) => (err.message.includes("before the command was written") ? "failed" : err.message));
+      await vi.waitFor(() => expect(client.written).toHaveLength(1));
+      client.child.stdout.once("data", client.exit);
+      client.answer("x");
+      expect(await run).toBe(outcome);
+      expect(client.written).toHaveLength(1);
+      expect(spawned.filter((a) => a[1] !== "display-message" || a.length > 6)).toEqual(outcome === "spawned" ? [[...argv]] : []);
+      await exec.close();
+    }
+  });
+
   it("spawns load-buffer, alone or in a chain: the server would open the file itself", async () => {
     const client = fakeClient();
     const { spawned, fallback } = fakeSpawned();
