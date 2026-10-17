@@ -84,33 +84,47 @@ function fakeSpawned(answer: (argv: string[]) => string | Promise<string> = () =
 }
 
 describe("tmuxControlExec", () => {
-  it("fails only a read that has no reply in time, keeps the client, and gives each later reply its own command", async () => {
-    const client = fakeClient();
+  it("drops a client once the reply at the head of its line is overdue, and starts a new one for the next command", async () => {
+    const clients = [fakeClient(), fakeClient()];
+    let started = 0;
     const { spawned, fallback } = fakeSpawned(() => "spawned read\n");
-    const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, replyTimeoutMs: 50 });
+    const exec = tmuxControlExec(fallback, { spawnClient: () => clients[started++]!.child, replyTimeoutMs: 50 });
 
-    const slowRead = exec(["tmux", "capture-pane", "-p", "-J", "-t", "=seat@rig:", "-S", "-", "-E", "-"]);
-    await vi.waitFor(() => expect(client.written).toHaveLength(1));
-    const write = exec(["tmux", "send-keys", "-t", "=seat@rig:", "Enter"]);
-    await vi.waitFor(() => expect(client.written).toHaveLength(2));
-    let writeSettled = false;
-    void write.finally(() => { writeSettled = true; });
+    const stuckRead = exec(["tmux", "capture-pane", "-p", "-J", "-t", "=seat@rig:", "-S", "-", "-E", "-"]);
+    await vi.waitFor(() => expect(clients[0]!.written).toHaveLength(1));
+    const writeError = exec(["tmux", "send-keys", "-t", "=seat@rig:", "Enter"]).then(() => null, (err: Error) => err.message);
+    await vi.waitFor(() => expect(clients[0]!.written).toHaveLength(2), { interval: 5 });
 
-    // The read is past its time: it is asked of a spawned client, and the write in flight waits for its own reply.
-    expect(await slowRead).toBe("spawned read\n");
+    // No reply comes: the client is ended, the read asked of a spawned client, and the write, which was written to the
+    // ended client and may have landed, reported failed rather than sent again.
+    expect(await stuckRead).toBe("spawned read\n");
+    expect(await writeError).toBe("tmux control client ended: no reply within 50 ms");
+    expect(clients[0]!.kill).toHaveBeenCalled();
     expect(spawned.map((argv) => argv[1])).toEqual(["capture-pane"]);
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(writeSettled).toBe(false);
-    expect(client.kill).not.toHaveBeenCalled();
 
-    client.answer("the whole history, late");
-    client.answer();
-    expect(await write).toBe("");
     const read = exec(["tmux", "display-message", "-p", "-t", "=seat@rig:", "x"]);
-    await vi.waitFor(() => expect(client.written).toHaveLength(3));
-    client.answer("x");
+    await vi.waitFor(() => expect(clients[1]!.written).toHaveLength(1));
+    clients[1]!.answer("x");
     expect(await read).toBe("x\n");
-    expect(spawned).toHaveLength(1);
+    expect(started).toBe(2);
+    await exec.close();
+  });
+
+  it("keeps a client whose line moves: each reply restarts the wait of the command behind it", async () => {
+    const client = fakeClient();
+    const { spawned, fallback } = fakeSpawned();
+    const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, replyTimeoutMs: 200 });
+
+    const reads = [1, 2, 3].map((n) => exec(["tmux", "display-message", "-p", "-t", "=seat@rig:", `r${n}`]));
+    await vi.waitFor(() => expect(client.written).toHaveLength(3), { interval: 5 });
+    // 360 ms in all, each reply within 120 ms of the one before.
+    for (const n of [1, 2, 3]) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      client.answer(`r${n}`);
+    }
+    expect(await Promise.all(reads)).toEqual(["r1\n", "r2\n", "r3\n"]);
+    expect(client.kill).not.toHaveBeenCalled();
+    expect(spawned).toEqual([]);
     await exec.close();
   });
 

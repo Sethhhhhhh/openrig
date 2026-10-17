@@ -120,9 +120,16 @@ export class ControlReplies {
   /** Set once the client is gone: nothing will be answered any more. */
   private failure: Error | null = null;
   onAttached?: () => void;
+  /** Called after each command's reply. */
+  onReply?: () => void;
 
   get closed(): boolean {
     return this.failure !== null;
+  }
+
+  /** The commands written and not answered yet. */
+  get waiting(): number {
+    return this.pending.length;
   }
 
   expect(pending: Pending): void {
@@ -158,6 +165,7 @@ export class ControlReplies {
       }
       if ((flags & 1) === 0) return;
       this.pending.shift()?.resolve({ ok, lines: this.lines });
+      this.onReply?.();
       return;
     }
     this.lines.push(line);
@@ -185,8 +193,9 @@ export type SpawnControlClient = () => ChildProcessWithoutNullStreams;
 
 export interface TmuxControlOptions {
   spawnClient?: SpawnControlClient;
-  /** A read with no reply within this is asked again of a spawned client; the control client goes on. Also the time
-   *  the client has to attach. */
+  /** Once the command at the head of the line has had no reply for this long, the client is ended: the reads it owed
+   *  are asked again of a spawned client, the writes it owed fail, and the next command starts a new client. Also the
+   *  time a client has to attach. */
   replyTimeoutMs?: number;
   now?: () => number;
 }
@@ -198,14 +207,18 @@ const NOT_WRITTEN = new Error("tmux control client ended before the command was 
 interface ControlClient {
   child: ChildProcessWithoutNullStreams;
   replies: ControlReplies;
+  /** Since when the command at the head of the line has waited: its write, or the reply before it. */
+  headSince: number;
+  /** Fires once that wait is past the reply timeout. */
+  timer?: ReturnType<typeof setTimeout>;
 }
+
+export type TmuxControlExec = ArgvExecFn & { close: () => Promise<void> };
 
 /**
  * The ArgvExecFn the daemon's TmuxAdapter runs with: routed commands go to the control client, every other one, or any
  * while the client cannot run, to `fallback` (the spawned client).
  */
-export type TmuxControlExec = ArgvExecFn & { close: () => Promise<void> };
-
 export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOptions = {}): TmuxControlExec {
   const spawnClient = options.spawnClient ?? (() => spawn("tmux", ["-C", "attach-session", "-t", `=${CONTROL_SESSION}`, "-f", "no-output,ignore-size"], {
     stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
@@ -219,13 +232,33 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
   let failures = 0;
   let retryAt = 0;
 
-  const drop = (child: ChildProcessWithoutNullStreams, reason: string): void => {
-    if (client?.child !== child) return;
-    client.replies.failAll(new Error(`tmux control client ended: ${reason}`));
-    client = null;
+  const backOff = (): void => {
     retryAt = now() + RETRY_MS[Math.min(failures, RETRY_MS.length - 1)]!;
     failures++;
+  };
+
+  /** Ends the client and fails what it still owes. One that ended on its own is started again after a while; one
+   *  dropped for a reply overdue, at the next command. */
+  const drop = (child: ChildProcessWithoutNullStreams, reason: string, overdue = false): void => {
+    if (client?.child !== child) return;
+    clearTimeout(client.timer);
+    client.replies.failAll(new Error(`tmux control client ended: ${reason}`));
+    client = null;
+    if (overdue) retryAt = 0;
+    else backOff();
     child.kill();
+  };
+
+  /** Drops the client once the command at the head of its line has waited past the reply timeout: every later command
+   *  waits behind it, a write with no deadline of its own included. */
+  const watch = (c: ControlClient): void => {
+    clearTimeout(c.timer);
+    if (c.replies.waiting === 0) return;
+    c.timer = setTimeout(() => {
+      if (now() - c.headSince >= replyTimeoutMs) drop(c.child, `no reply within ${replyTimeoutMs} ms`, true);
+      else watch(c);
+    }, Math.max(0, c.headSince + replyTimeoutMs - now()));
+    c.timer.unref?.();
   };
 
   /** The control session's id on the server it was last made or marked on, which the daemon's stop kills. */
@@ -274,6 +307,11 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     if (closed) return null;
     const child = spawnClient();
     const replies = new ControlReplies();
+    const started: ControlClient = { child, replies, headSince: 0 };
+    replies.onReply = () => {
+      started.headSince = now();
+      watch(started);
+    };
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => replies.push(chunk));
     child.stderr.resume();
@@ -288,7 +326,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       replies.onAttached = () => { clearTimeout(timer); resolve(true); };
       child.once("exit", () => { clearTimeout(timer); resolve(false); });
     });
-    client = { child, replies };
+    client = started;
     if (!attached || closed) {
       drop(child, closed ? "closed" : "did not attach");
       return null;
@@ -305,23 +343,19 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     return starting;
   };
 
-  /** One command's reply. A read with none in time fails alone, without ending the client its other commands share: it
-   *  keeps its place in line, so its late reply is still taken for it (and dropped) and every later reply stays its own
-   *  command's. A write waits for its reply, as a spawned client waits for tmux: timing it out would report a failure
-   *  for input that may have landed. */
-  const send = (target: ControlClient, args: string[], deadline: boolean): Promise<{ ok: boolean; lines: string[] }> =>
+  /** One command's reply, or the client's end: the whole line is failed when its head waits too long (`watch`), so no
+   *  command waits behind a client that stopped answering, and every reply stays its own command's. */
+  const send = (target: ControlClient, args: string[]): Promise<{ ok: boolean; lines: string[] }> =>
     new Promise((resolve, reject) => {
       // A chain's client may have ended after an earlier command's reply: nothing is written to it.
       if (target.replies.closed) {
         reject(NOT_WRITTEN);
         return;
       }
-      const timer = deadline ? setTimeout(() => reject(new Error(`tmux control client: no reply within ${replyTimeoutMs} ms`)), replyTimeoutMs) : undefined;
-      target.replies.expect({
-        resolve: (reply) => { clearTimeout(timer); resolve(reply); },
-        reject: (error) => { clearTimeout(timer); reject(error); },
-      });
+      if (target.replies.waiting === 0) target.headSince = now();
+      target.replies.expect({ resolve, reject });
       target.child.stdin.write(`${args.map(quote).join(" ")}\n`);
+      watch(target);
     });
 
   const exec = async (argvIn: string[]): Promise<string> => {
@@ -340,10 +374,11 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     for (const [index, command] of commands.entries()) {
       let reply: { ok: boolean; lines: string[] };
       try {
-        reply = await send(target, command, !writes);
+        reply = await send(target, command);
       } catch (err) {
         // A read, or a call of which nothing was written, is run again by a spawned client. A write fails when its
-        // client ended after it was written: it may have landed, so its failure is reported, never repeated.
+        // client ended (or was dropped, its line overdue) after it was written: it may have landed, so its failure is
+        // reported, never repeated.
         if (writes && !(err === NOT_WRITTEN && index === 0)) throw err;
         return fallback(argv);
       }
