@@ -102,13 +102,16 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     await control(["tmux", "load-buffer", "-b", "b1", file]);
     await control(["tmux", "paste-buffer", "-t", "=typed@rig:", "-b", "b1", "-d", "-r"]);
     await control(["tmux", "send-keys", "-t", "=typed@rig:", "Enter"]);
+    // cat echoes each line it reads: the typed line, then cat's copy. Its copy is awaited before the next line is typed,
+    // else the two can interleave on the screen.
+    const lines = (count: number) => vi.waitFor(() => {
+      const pane = tmux("capture-pane", "-p", "-t", "=typed@rig:");
+      expect(pane.split("\n").filter((l) => l.includes("braces")), pane).toEqual(Array<string>(count).fill(text));
+    }, { timeout: 5000, interval: 100 });
+    await lines(2);
     await control(["tmux", "send-keys", "-t", "=typed@rig:", "-l", text]);
     await control(["tmux", "send-keys", "-t", "=typed@rig:", "Enter"]);
-    // cat echoes each line it reads: the typed line, then cat's copy, twice.
-    await vi.waitFor(() => {
-      const pane = tmux("capture-pane", "-p", "-t", "=typed@rig:");
-      expect(pane.split("\n").filter((l) => l.includes("braces")), pane).toEqual([text, text, text, text]);
-    }, { timeout: 5000, interval: 100 });
+    await lines(4);
   });
 
   it("keeps working when its client or its session is killed, and comes back", async () => {

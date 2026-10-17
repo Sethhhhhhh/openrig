@@ -8,8 +8,8 @@ import type { ArgvExecFn } from "./tmux.js";
  * 0.3 ms for a line written to a client already connected. The client is attached to a session of its own, which the
  * daemon's listings leave out. What it runs and what it gives back are the spawned client's: the same command line,
  * the same stdout, the same error text in `execStderr`, a chain stopped at its first failing command. Anything else
- * (a launch, which takes the spawning process's environment; a command line that cannot be written on one line; a
- * global flag; a tmux before 3.2; no server yet) goes to the spawned client, as before.
+ * (a launch, which takes the spawning process's environment; `load-buffer`, see ROUTED; a command line that cannot be
+ * written on one line; a global flag; a tmux before 3.2; no server yet) goes to the spawned client, as before.
  */
 
 export const CONTROL_SESSION = "openrig-control";
@@ -18,10 +18,12 @@ export const CONTROL_SESSION = "openrig-control";
 const NOT_CONTROL_SESSION = `#{!=:#{session_name},${CONTROL_SESSION}}`;
 
 // Commands that only read the server or write into a pane, whose outcome does not depend on the client that sends
-// them as long as they name their target. A launch or an environment change stays spawned.
+// them as long as they name their target. A launch or an environment change stays spawned. So does `load-buffer`: it
+// would have the server open the file itself, in its own loop (a FIFO with no writer stops the whole server) and in its
+// own view of the filesystem, where a spawned client reads the file and hands the server its bytes.
 const ROUTED = new Set([
   "capture-pane", "display-message", "has-session", "list-sessions", "list-windows", "list-panes", "list-clients",
-  "show-environment", "load-buffer", "paste-buffer", "delete-buffer", "send-keys",
+  "show-environment", "paste-buffer", "delete-buffer", "send-keys",
 ]);
 
 /** Whether a command acts on the same target from any client: a control client's own session would otherwise be the
@@ -29,7 +31,7 @@ const ROUTED = new Set([
 function namesItsTarget(args: string[]): boolean {
   const [command] = args;
   if (args.includes("-t")) return true;
-  if (command === "list-sessions" || command === "list-clients" || command === "load-buffer" || command === "delete-buffer") return true;
+  if (command === "list-sessions" || command === "list-clients" || command === "delete-buffer") return true;
   if (command === "list-windows" || command === "list-panes") return args.includes("-a");
   if (command === "show-environment") return args.includes("-g");
   return false;
@@ -285,7 +287,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     const argv = supported ? withoutControlSession(argvIn) : argvIn;
     if (!target) return fallback(argv);
     const commands = commandsOf(argv.slice(1));
-    const writes = commands.some((c) => c[0] === "send-keys" || c[0] === "paste-buffer" || c[0] === "load-buffer");
+    const writes = commands.some((c) => c[0] === "send-keys" || c[0] === "paste-buffer");
     let stdout = "";
     for (const [index, command] of commands.entries()) {
       let reply: { ok: boolean; lines: string[] };

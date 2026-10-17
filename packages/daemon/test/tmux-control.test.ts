@@ -109,7 +109,7 @@ describe("tmuxControlExec", () => {
       return "";
     }, { spawnClient: () => client.child, replyTimeoutMs: 50 });
 
-    const chain = exec(["tmux", "load-buffer", "-b", "b1", "/tmp/x", ";", "paste-buffer", "-b", "b1", "-t", "=seat@rig:"]);
+    const chain = exec(["tmux", "paste-buffer", "-b", "b1", "-t", "=seat@rig:", ";", "delete-buffer", "-b", "b1"]);
     await vi.waitFor(() => expect(client.written).toHaveLength(1));
     // The client ends as soon as its reply to the first command is read, before the chain goes on.
     client.child.stdout.once("data", () => (client.child as unknown as EventEmitter).emit("exit", null, "SIGTERM"));
@@ -117,6 +117,27 @@ describe("tmuxControlExec", () => {
     await expect(chain).rejects.toThrow("before the command was written");
     expect(client.written).toHaveLength(1);
     expect(spawned).toEqual([]);
+    exec.close();
+  });
+
+  it("spawns load-buffer, alone or in a chain: the server would open the file itself", async () => {
+    const client = fakeClient();
+    const spawned: string[][] = [];
+    const exec = tmuxControlExec(async (argv) => {
+      if (argv[1] === "-V") return "tmux 3.6\n";
+      if (argv[1] === "has-session") return "";
+      spawned.push(argv);
+      return "";
+    }, { spawnClient: () => client.child, replyTimeoutMs: 50 });
+
+    const read = exec(["tmux", "display-message", "-p", "-t", "=seat@rig:", "x"]);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1));
+    client.answer("x");
+    await read;
+    await exec(["tmux", "load-buffer", "-b", "b1", "/tmp/fifo"]);
+    await exec(["tmux", "load-buffer", "-b", "b1", "/tmp/fifo", ";", "paste-buffer", "-b", "b1", "-t", "=seat@rig:"]);
+    expect(spawned.map((argv) => argv[1])).toEqual(["load-buffer", "load-buffer"]);
+    expect(client.written).toHaveLength(1);
     exec.close();
   });
 });
