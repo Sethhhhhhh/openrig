@@ -54,6 +54,8 @@ describe("bin-wrapper", () => {
     fs.mkdirSync(dist);
     const wrapper = path.join(dist, "bin-wrapper.js");
     fs.writeFileSync(wrapper, "");
+    // Its own module type, as the package declares it: Node before 22.7 would read the fixture as CommonJS.
+    fs.writeFileSync(path.join(dist, "package.json"), '{ "type": "module" }\n');
     // An install missing one command's module: the lazy program loads, the command's import fails.
     fs.writeFileSync(path.join(dist, "lazy-program.js"),
       "export async function createLazyProgram() { return (await import('./commands/queue.js')).queueCommand(); }\nexport async function runProgram() { return 0; }\n");
