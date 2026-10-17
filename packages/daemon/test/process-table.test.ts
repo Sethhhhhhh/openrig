@@ -9,7 +9,7 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...actual, default: actual, readFileSync: vi.fn(actual.readFileSync) };
 });
 import { readProcessTable, readProcTable } from "../src/domain/process-table.js";
-import { listNativeProcesses } from "../src/domain/native-process-lineage.js";
+import { claudeCommandSessionToken, listNativeProcesses, processArgv } from "../src/domain/native-process-lineage.js";
 import { defaultListProcessesStrict } from "../src/domain/resume-metadata-refresher.js";
 
 let scratch: string | undefined;
@@ -51,7 +51,7 @@ describe("readProcTable", () => {
       { pid: 1, ppid: 0, pgid: 1, tpgid: -1, executableName: "systemd", startedAt: "Tue Oct  6 09:00:12 2026", command: "/sbin/init splash" },
       { pid: 2, ppid: 0, pgid: 0, tpgid: -1, executableName: "kworker/u32:4-e", startedAt: "Tue Oct  6 09:00:00 2026", command: "[kworker/u32:4-events_unbound]" },
       { pid: 40, ppid: 1, pgid: 40, tpgid: -1, executableName: "tmux: server (x", startedAt: "Tue Oct  6 09:05:01 2026", command: "tmux new-session -d" },
-      { pid: 41, ppid: 40, pgid: 41, tpgid: 41, executableName: "claude", startedAt: "Tue Oct  6 10:00:00 2026", command: "claude --resume tok-1 a.b x y é" },
+      { pid: 41, ppid: 40, pgid: 41, tpgid: 41, executableName: "claude", startedAt: "Tue Oct  6 10:00:00 2026", command: "claude --resume tok-1 a.b x y ??" },
       { pid: 42, ppid: 40, pgid: 41, tpgid: 41, executableName: "sh", startedAt: "Tue Oct  6 10:00:00 2026", command: "[sh] <defunct>" },
     ]);
   });
@@ -63,8 +63,17 @@ describe("readProcTable", () => {
       7: { stat: Buffer.concat([Buffer.from("7 ("), comm, Buffer.from(stat(7, "", "S", 2, 0, -1, 0).slice("7 (".length))]), cmdline: "" },
     });
     const [row] = await readProcTable(root);
-    expect(row!.executableName).toBe("abc�defghijklm�");
-    expect(row!.command).toBe("[abc�defghijklméxyz]");
+    expect(row!.executableName).toBe("abc?defghijklm?");
+    expect(row!.command).toBe("[abc?defghijklm??xyz]");
+  });
+
+  it("prints each byte of a non-ASCII character as ps does in the C locale, so it never splits an argument", async () => {
+    // One argument holding a no-break space (U+00A0, bytes C2 A0) between an option and its value.
+    const root = fakeProc(0, { 41: { stat: stat(41, "claude", "S", 1, 41, 41, 0), cmdline: "claude\0--resume tok-1\0" } });
+    const [row] = await readProcTable(root);
+    expect(row!.command).toBe("claude --resume??tok-1");
+    expect(processArgv(row!.command)).toEqual(["claude", "--resume??tok-1"]);
+    expect(claudeCommandSessionToken(row!.command)).toBeNull();
   });
 
   it("hands the event loop back while it lists, then every 50 pids, so a large table never blocks it whole", async () => {

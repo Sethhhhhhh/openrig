@@ -67,10 +67,11 @@ function lstart(epochSeconds: number): string {
   return `${DAYS[d.getDay()]} ${MONTHS[d.getMonth()]} ${String(d.getDate()).padStart(2, " ")} ${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())} ${d.getFullYear()}`;
 }
 
-/** What ps prints of a name or command line: a control character is a `.`. (In the C locale ps also prints each
- *  byte of a non-ASCII character as `?`; this keeps the text.) */
-function printable(text: string): string {
-  return text.replace(/[\u0000-\u001f\u007f]/g, ".");
+/** What ps prints in the C locale of a name or command line read one character a byte (latin1): a control character
+ *  is a `.`, each byte of a non-ASCII character a `?`. Identity reads the command line as ps prints it: a character
+ *  such as a no-break space inside an argument is no separator there. */
+function printable(bytes: string): string {
+  return bytes.replace(/[\u0000-\u001f\u007f]/g, ".").replace(/[\u0080-\u00ff]/g, "?");
 }
 
 /** Pids read between two turns of the event loop: some 2 ms of reads at ~40 µs a pid. */
@@ -99,9 +100,9 @@ function readProcRow(root: string, pid: string, bootTime: number): ProcessTableR
   let stat: string;
   let cmdline: string;
   try {
-    // utf8: Node reads it in one native call, where another encoding or a Buffer costs about twice as much.
-    stat = readFileSync(`${root}/${pid}/stat`, "utf8");
-    cmdline = readFileSync(`${root}/${pid}/cmdline`, "utf8");
+    // latin1: one character a byte, so names are cut and printed on bytes as ps does.
+    stat = readFileSync(`${root}/${pid}/stat`, "latin1");
+    cmdline = readFileSync(`${root}/${pid}/cmdline`, "latin1");
   } catch {
     return null; // exited between the listing and the read
   }
@@ -112,9 +113,6 @@ function readProcRow(root: string, pid: string, bootTime: number): ProcessTableR
   if (close < 0 || fields.length < 20) return null;
   const comm = stat.slice(stat.indexOf("(") + 1, close);
   const name = printable(comm);
-  // ucomm is cut on bytes, as the kernel cuts it: a name holding bytes that are no UTF-8 (rare) is read again as bytes,
-  // since its decoded text no longer counts them.
-  const nameBytes = comm.includes("�") ? commBytes(root, pid) ?? Buffer.from(comm) : Buffer.from(comm);
   // A kernel thread or a zombie has no command line: ps shows its name in brackets.
   const command = printable(cmdline.replace(/[\0\n]/g, " ")).trim()
     || `[${name}]${fields[0] === "Z" ? " <defunct>" : ""}`;
@@ -124,18 +122,9 @@ function readProcRow(root: string, pid: string, bootTime: number): ProcessTableR
     pgid: Number(fields[2]),
     tpgid: Number(fields[5]),
     // The kernel may give a worker thread a longer name; ucomm is the task name's 15 bytes.
-    executableName: printable(nameBytes.subarray(0, 15).toString("utf8")),
+    executableName: printable(comm.slice(0, 15)),
     startedAt: lstart(bootTime + Math.floor(Number(fields[19]) / TICKS_PER_SECOND)),
     command,
   };
 }
 
-/** The raw bytes of a task's name, from its stat; null once it has exited. */
-function commBytes(root: string, pid: string): Buffer | null {
-  try {
-    const stat = readFileSync(`${root}/${pid}/stat`);
-    return stat.subarray(stat.indexOf("(") + 1, stat.lastIndexOf(")"));
-  } catch {
-    return null;
-  }
-}
