@@ -18,6 +18,7 @@ export interface ProcessTableRow {
 }
 
 let inFlight: Promise<ProcessTableRow[]> | null = null;
+let procRoot = "/proc";
 
 /**
  * The OS process table, every observer's one source: read from /proc on Linux, where a `ps` would cost the daemon a
@@ -26,8 +27,14 @@ let inFlight: Promise<ProcessTableRow[]> | null = null;
  * read.
  */
 export function readProcessTable(): Promise<ProcessTableRow[]> {
-  inFlight ??= (process.platform === "linux" ? readProcTable() : readPsTable()).finally(() => { inFlight = null; });
+  inFlight ??= (process.platform === "linux" ? readProcTable(procRoot) : readPsTable()).finally(() => { inFlight = null; });
   return inFlight;
+}
+
+/** Points the Linux read at a /proc of a test's own, so a scenario's processes reach the observers through it; no
+ *  argument puts the real /proc back. */
+export function setProcRootForTest(root = "/proc"): void {
+  procRoot = root;
 }
 
 const PS_ROW = /^(\d+)\s+(\d+)\s+(-?\d+)\s+(-?\d+)\s+(.+?)\s+(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/;
