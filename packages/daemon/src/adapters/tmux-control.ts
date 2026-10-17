@@ -294,7 +294,8 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       try {
         supported = supportsControlMode(await fallback(["tmux", "-V"]));
       } catch {
-        return null; // tmux could not even say its version: asked again later.
+        backOff(); // tmux could not even say its version: asked again later, not at every command.
+        return null;
       }
     }
     if (!supported) return null;
@@ -358,6 +359,23 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
       watch(target);
     });
 
+  /** The error of a write whose client ended before its reply, with what a spawned client finds of its target now: a
+   *  server or session gone reads as a spawned client's failure would (`no server running`, `can't find session`), so
+   *  the adapter classifies it the same way. A client dropped for no reply is not asked about: the server is not
+   *  answering, and a spawned client would wait on it as long. */
+  const failedWrite = async (command: string[], err: Error): Promise<Error> => {
+    const t = command.indexOf("-t");
+    if (err.message.includes("no reply within") || t < 0 || t + 1 >= command.length) return err;
+    try {
+      await fallback(["tmux", "display-message", "-p", "-t", command[t + 1]!, ""]);
+      return err;
+    } catch (probe) {
+      const stderr = (probe as { execStderr?: unknown }).execStderr;
+      return Object.assign(new Error(`${err.message}; then ${(probe as Error).message}`),
+        typeof stderr === "string" ? { execStderr: stderr } : {});
+    }
+  };
+
   const exec = async (argvIn: string[]): Promise<string> => {
     const [bin, ...argsIn] = argvIn;
     const commandsIn = commandsOf(argsIn);
@@ -379,7 +397,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
         // A read, or a call of which nothing was written, is run again by a spawned client. A write fails when its
         // client ended (or was dropped, its line overdue) after it was written: it may have landed, so its failure is
         // reported, never repeated.
-        if (writes && !(err === NOT_WRITTEN && index === 0)) throw err;
+        if (writes && !(err === NOT_WRITTEN && index === 0)) throw await failedWrite(command, err as Error);
         return fallback(argv);
       }
       const text = reply.lines.length > 0 ? `${reply.lines.join("\n")}\n` : "";

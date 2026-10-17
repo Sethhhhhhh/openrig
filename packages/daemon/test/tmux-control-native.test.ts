@@ -177,6 +177,33 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     vi.useRealTimers();
   });
 
+  it("follows a kill-server and a new server: it fails over to spawned clients, then attaches to the new one", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    await control(["tmux", "has-session", "-t", "=seat@rig"]);
+    tmux("kill-server");
+    await expect(control(["tmux", "has-session", "-t", "=seat@rig"])).rejects.toThrow(/no server running|error connecting/);
+    tmux("new-session", "-d", "-s", "next@rig", "-x", "80", "-y", "24", "exec cat");
+    vi.setSystemTime(Date.now() + 60_000);
+    expect(await control(["tmux", "has-session", "-t", "=next@rig"])).toBe("");
+    const connecting = spawned.length;
+    expect(await control(["tmux", "list-sessions", "-F", "#{session_name}"])).toBe("next@rig\n");
+    expect(spawned.slice(connecting)).toEqual([]);
+    expect(tmux("show-options", "-v", "-t", `=${CONTROL_SESSION}:`, CONTROL_OPTION).trim()).toBe("1");
+    vi.useRealTimers();
+  });
+
+  it("gives a write to a session that is gone the spawned client's error, and the adapter the same code", async () => {
+    await control(["tmux", "has-session", "-t", "=seat@rig"]);
+    tmux("kill-session", "-t", "=seat@rig");
+    const argv = ["tmux", "send-keys", "-t", "=seat@rig:", "Enter"];
+    const connecting = spawned.length;
+    expect(await outcome(control, argv)).toEqual(await outcome(execArgvCommand, argv));
+    expect(spawned.slice(connecting)).toEqual([]);
+    for (const exec of [control, execArgvCommand]) {
+      expect(await new TmuxAdapter(async () => "", undefined, exec).sendKeys("=seat@rig:", ["Enter"])).toMatchObject({ ok: false, code: "session_not_found" });
+    }
+  });
+
   it("starts no server of its own and spawns what it does not route", async () => {
     tmux("kill-server");
     const spawned: string[][] = [];

@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { commandsOf, ControlReplies, supportsControlMode, tmuxControlExec, withoutControlSession } from "../src/adapters/tmux-control.js";
+import { TmuxAdapter } from "../src/adapters/tmux.js";
 
 function replies(): { replies: ControlReplies; answers: Array<{ ok: boolean; lines: string[] }>; attached: () => boolean } {
   const r = new ControlReplies();
@@ -107,6 +108,53 @@ describe("tmuxControlExec", () => {
     clients[1]!.answer("x");
     expect(await read).toBe("x\n");
     expect(started).toBe(2);
+    await exec.close();
+  });
+
+  it("fails a write in flight when its client ends, never sends it again, and says what a spawned client finds", async () => {
+    const client = fakeClient();
+    const { spawned, fallback } = fakeSpawned();
+    const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, replyTimeoutMs: 1000 });
+
+    // The control session is killed while the write waits for its reply: the seat is still there.
+    const first = exec(["tmux", "send-keys", "-t", "=seat@rig:", "-l", "hello"]).then(() => null, (err: Error) => err.message);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1), { interval: 5 });
+    client.exit();
+    expect(await first).toBe("tmux control client ended: exited (SIGTERM)");
+    expect(spawned).toEqual([["tmux", "display-message", "-p", "-t", "=seat@rig:", ""]]);
+    await exec.close();
+  });
+
+  it("reports a write whose client ended with its server as a spawned client does: session_not_found", async () => {
+    const client = fakeClient();
+    const gone = Object.assign(new Error("Command failed: tmux display-message\nno server running on /tmp/tmux-1000/default\n"),
+      { execStderr: "no server running on /tmp/tmux-1000/default\n" });
+    const { spawned, fallback } = fakeSpawned(() => { throw gone; });
+    const exec = tmuxControlExec(fallback, { spawnClient: () => client.child, replyTimeoutMs: 1000 });
+    // Connected first, then the server goes while a write waits.
+    const read = exec(["tmux", "has-session", "-t", "=seat@rig"]);
+    await vi.waitFor(() => expect(client.written).toHaveLength(1), { interval: 5 });
+    client.answer();
+    await read;
+    const adapter = new TmuxAdapter(async () => "", undefined, exec);
+    const sent = adapter.sendKeys("=seat@rig:", ["Enter"]);
+    await vi.waitFor(() => expect(client.written).toHaveLength(2), { interval: 5 });
+    client.exit();
+    expect(await sent).toMatchObject({ ok: false, code: "session_not_found" });
+    expect(spawned.map((argv) => argv[1])).toEqual(["display-message"]);
+    await exec.close();
+  });
+
+  it("backs off when tmux cannot say its version, instead of asking at every command", async () => {
+    const spawned: string[][] = [];
+    const exec = tmuxControlExec(async (argv) => {
+      spawned.push(argv);
+      if (argv[1] === "-V") throw new Error("spawn tmux ENOENT");
+      return "";
+    }, { spawnClient: () => { throw new Error("no client expected"); } });
+    await exec(["tmux", "has-session", "-t", "=seat@rig"]);
+    await exec(["tmux", "has-session", "-t", "=seat@rig"]);
+    expect(spawned.map((argv) => argv[1])).toEqual(["-V", "has-session", "has-session"]);
     await exec.close();
   });
 
