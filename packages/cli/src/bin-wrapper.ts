@@ -5,7 +5,7 @@ import path from "node:path";
 import { existsSync, realpathSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { formatCliError, wantsJsonOutput, type RunProgramIo } from "./cli-error.js";
+import type { RunProgramIo } from "./cli-error.js";
 
 const REEXEC_GUARD_ENV = "OPENRIG_BIN_REEXEC";
 
@@ -87,8 +87,16 @@ export function canLoadInstalledNative(node: string, wrapper: string): boolean {
 
 /** A command whose modules cannot be loaded fails as any other command does: the shared error object on stdout under
  *  `--json`, `error: …` on stderr otherwise, and exit 1. A human run also gets the stack, which names the module and
- *  line that failed, as Node's own crash did. */
-function failedToLoad(argv: string[], error: unknown, io: RunProgramIo): void {
+ *  line that failed, as Node's own crash did. The error helpers are imported only here: statically, they and the
+ *  client they import would load before the compile cache is on. Should they fail to load too, Node's crash stands. */
+async function failedToLoad(argv: string[], error: unknown, io: RunProgramIo): Promise<void> {
+  let helpers: typeof import("./cli-error.js");
+  try {
+    helpers = await import("./cli-error.js");
+  } catch {
+    throw error;
+  }
+  const { formatCliError, wantsJsonOutput } = helpers;
   const failure = formatCliError(error);
   const out = io.out ?? ((l: string) => process.stdout.write(l + "\n"));
   const err = io.err ?? ((l: string) => process.stderr.write(l + "\n"));
@@ -108,10 +116,9 @@ export async function run(argv = process.argv, io: RunProgramIo = {}): Promise<v
   }
 
   const entryPath = resolveBinEntry(normalizedArgv[1], import.meta.url);
-  // A named command loads only its own module (lazy-program.ts); feature-detected like the front
-  // door below, so the wrapper still runs an older sibling entry that has no lazy program.
-  const lazyPath = path.join(path.dirname(entryPath), "lazy-program.js");
-  if (normalizedArgv.length > 2 && existsSync(lazyPath)) {
+  // A named command loads only its own module (lazy-program.ts), which ships beside the entry.
+  if (normalizedArgv.length > 2) {
+    const lazyPath = path.join(path.dirname(entryPath), "lazy-program.js");
     let lazy: {
       createLazyProgram: (first: string | undefined) => Promise<import("commander").Command | null>;
       runProgram: (program: import("commander").Command, argv: string[], io?: RunProgramIo) => Promise<number>;
@@ -121,7 +128,7 @@ export async function run(argv = process.argv, io: RunProgramIo = {}): Promise<v
       lazy = await import(pathToFileURL(lazyPath).href) as typeof lazy;
       program = await lazy.createLazyProgram(normalizedArgv[2]);
     } catch (error) {
-      failedToLoad(normalizedArgv, error, io);
+      await failedToLoad(normalizedArgv, error, io);
       return;
     }
     if (program) {
@@ -139,7 +146,7 @@ export async function run(argv = process.argv, io: RunProgramIo = {}): Promise<v
   try {
     mod = await import(entryUrl) as typeof mod;
   } catch (error) {
-    failedToLoad(normalizedArgv, error, io);
+    await failedToLoad(normalizedArgv, error, io);
     return;
   }
   // Slice 17: the PUBLIC bin is the real front door — bare `rig` in a TTY

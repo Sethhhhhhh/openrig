@@ -5,6 +5,8 @@
 import { Command } from "commander";
 import { configureRoot } from "./program-root.js";
 
+// The wrapper runs the program with this runProgram, from beside the commands, so it loads after the compile cache
+// is on and its daemon-error checks see the client module the commands throw from.
 export { runProgram } from "./cli-error.js";
 
 type Load = () => Promise<Command>;
