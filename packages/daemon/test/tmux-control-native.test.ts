@@ -229,10 +229,14 @@ describe.skipIf(!supportsControlMode(version))("tmux control mode against a real
     writeFileSync(shell, `#!/bin/sh\ntouch ${join(dir, "shell-ran")}\nexec sh "$@"\n`, { mode: 0o755 });
     tmux("set-option", "-g", "default-shell", shell);
     await control(["tmux", "has-session", "-t", "=seat@rig"]);
-    // The pane reads as the server (tmux) until its fork has exec'd sh.
-    await vi.waitFor(() => expect(tmux("display-message", "-p", "-t", `=${controlSessionName(control.owner)}:`, "#{pane_current_command}").trim()).toBe("sh"),
-      { timeout: 5000, interval: 50 });
+    const pane = (format: string) => tmux("display-message", "-p", "-t", `=${controlSessionName(control.owner)}:`, format).trim();
+    // The pane reads as the server (tmux) until its fork has exec'd what it runs: past that, a default-shell started
+    // would have left its file.
+    await vi.waitFor(() => expect(pane("#{pane_current_command}")).not.toMatch(/^(tmux.*)?$/), { timeout: 5000, interval: 50 });
     expect(existsSync(join(dir, "shell-ran"))).toBe(false);
+    // The platform's sh: macOS's /bin/sh runs as bash.
+    expect(pane("#{pane_current_command}")).toMatch(/^(sh|bash|dash)$/);
+    expect(pane("#{pane_start_command}")).toContain("sleep 86400");
   });
 
   it("writes into the pane what a spawned client writes, whatever the text holds", async () => {
